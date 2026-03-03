@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+*.png
+.env
+supabase-config.json

@@ -1,0 +1,41 @@
+graph TB
+    subgraph Data Sources
+        YF[Yahoo Finance API]
+        Reddit[Reddit / Manual Trades]
+        Group[Group Chat Convos]
+    end
+
+    subgraph Scanners
+        ES[Elio Scanner<br/>Python + pm2]
+        AS[Ana Scanner<br/>Node.js + pm2]
+    end
+
+    subgraph Shared DB - Supabase
+        HC[(hourly_candles)]
+        BS[(breakout_signals)]
+        VH[(vix_hourly)]
+        MP[(market_predictions)]
+        TL[(trades_log)]
+    end
+
+    subgraph Outputs
+        iMsg[iMessage Group Alert]
+        Dash[Supabase Dashboard]
+    end
+
+    YF --> ES
+    YF --> AS
+    Reddit --> TL
+    Group --> MP
+
+    ES --> HC
+    ES --> BS
+    ES --> VH
+    AS --> HC
+    AS --> BS
+    AS --> VH
+
+    BS -->|BREAKOUT / BREAKDOWN| iMsg
+    HC --> Dash
+    BS --> Dash
+    MP --> Dash

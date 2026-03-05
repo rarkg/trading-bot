@@ -248,7 +248,7 @@ def main():
 
     for sym in ASSETS:
         data = datasets[sym]
-        engine = V13Engine(initial_capital=1000, fee_pct=0.045, max_risk_pct=5.0)
+        engine = V13Engine(initial_capital=1000, fee_pct=0.045, max_risk_pct=8.0)
         strat = SqueezeV13(btc_data=btc_data, asset_name=sym)
         if sym != "BTC":
             strat.set_btc_data(btc_data)

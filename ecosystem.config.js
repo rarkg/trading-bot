@@ -1,14 +1,29 @@
 module.exports = {
-  apps: [{
-    name: "trading-scanner",
-    script: "/Library/Developer/CommandLineTools/usr/bin/python3",
-    args: "/Users/elio/Projects/trading-bot/scanner.py",
-    cwd: "/Users/elio/Projects/trading-bot",
-    autorestart: true,
-    max_restarts: 10,
-    restart_delay: 5000,
-    env: {
-      PYTHONUNBUFFERED: "1"
-    }
-  }]
+  apps: [
+    {
+      name: "trading-scanner",
+      script: "/Library/Developer/CommandLineTools/usr/bin/python3",
+      args: "/Users/elio/Projects/trading-bot/scanner.py",
+      cwd: "/Users/elio/Projects/trading-bot",
+      autorestart: true,
+      max_restarts: 10,
+      restart_delay: 5000,
+      env: {
+        PYTHONUNBUFFERED: "1",
+      },
+    },
+    {
+      name: "paper-trader",
+      script: "scripts/run_paper_trading.py",
+      interpreter: "python3",
+      cwd: __dirname,
+      autorestart: true,
+      max_restarts: 10,
+      restart_delay: 5000,
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      env: {
+        PYTHONUNBUFFERED: "1",
+      },
+    },
+  ],
 };

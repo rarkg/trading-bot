@@ -36,7 +36,7 @@ ASSET_KELLY = {
 # Per-asset breakout stop/target ATR multipliers
 ASSET_BO_STOP = {
     "BTC": 2.0,
-    "ETH": 2.5,
+    "ETH": 2.0,
     "SOL": 1.5,
     "LINK": 2.5,
 }
@@ -437,7 +437,7 @@ class SqueezeV13:
         if regime == "VOLATILE":
             return 0.5
         if regime == "TRANSITION":
-            return 1.6
+            return 2.0
         if regime == "TRENDING":
             if (direction == "LONG" and trend == "UP") or (direction == "SHORT" and trend == "DOWN"):
                 return 1.4

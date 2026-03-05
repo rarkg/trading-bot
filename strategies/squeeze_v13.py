@@ -27,18 +27,34 @@ ASSET_DIRECTION_FILTER = {
 
 # Per-asset Kelly fractions (SOL has strongest edge in DB)
 ASSET_KELLY = {
-    "BTC": 0.40,
-    "ETH": 0.30,
+    "BTC": 0.55,
+    "ETH": 0.45,
     "SOL": 0.55,
-    "LINK": 0.40,
+    "LINK": 0.50,
+}
+
+# Per-asset BB period (BTC/LINK better with shorter, ETH/SOL with standard)
+ASSET_BB_PERIOD = {
+    "BTC": 16,
+    "ETH": 20,
+    "SOL": 20,
+    "LINK": 16,
+}
+
+# Per-asset minimum leverage floors (positive-edge assets shouldn't go below this)
+ASSET_MIN_LEVERAGE = {
+    "BTC": 2.5,
+    "ETH": 2.0,
+    "SOL": 3.0,
+    "LINK": 2.5,
 }
 
 # Per-asset max leverage to control drawdown
 ASSET_MAX_LEVERAGE = {
     "BTC": 8.0,
-    "ETH": 3.0,  # capped to control DD
+    "ETH": 4.0,  # raised from 3.0 — was capping 89% of trades
     "SOL": 8.0,
-    "LINK": 6.0,
+    "LINK": 8.0,  # raised from 6.0 — was capping 58% of trades
 }
 
 
@@ -76,8 +92,8 @@ class SqueezeV13:
         self.atr_volatile_pctile = atr_volatile_pctile / 100.0
         self.bb_width_sideways_ratio = bb_width_sideways_ratio
 
-        # Mean reversion
-        self.mr_bb_period = mr_bb_period
+        # Mean reversion — per-asset BB period
+        self.mr_bb_period = ASSET_BB_PERIOD.get(asset_name, mr_bb_period)
         self.mr_rsi_long = mr_rsi_long
         self.mr_rsi_short = mr_rsi_short
         self.mr_bb_entry_pct = mr_bb_entry_pct
@@ -382,19 +398,20 @@ class SqueezeV13:
             return 1.5  # negative edge: low but not minimum
 
         leverage = kelly * self.kelly_fraction * 20
-        return max(1.5, min(leverage, self.max_leverage))
+        min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+        return max(min_lev, min(leverage, self.max_leverage))
 
     def _regime_leverage_mult(self, regime, trend, direction):
         if regime == "VOLATILE":
             return 0.5
         if regime == "TRANSITION":
-            return 1.3
+            return 1.6
         if regime == "TRENDING":
             if (direction == "LONG" and trend == "UP") or (direction == "SHORT" and trend == "DOWN"):
                 return 1.4
             return 0.5
         # SIDEWAYS — strongest edge per DB
-        return 1.5
+        return 2.0
 
     def _btc_crashed(self, timestamp):
         if self._btc_roc is None:
@@ -453,7 +470,8 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("LONG")
             regime_mult = self._regime_leverage_mult(regime, trend, "LONG")
-            lev = round(max(0.5, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
 
             self._trailing_stop = price - (atr * 2.5)
             self._best_price = price
@@ -492,7 +510,8 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("SHORT")
             regime_mult = self._regime_leverage_mult(regime, trend, "SHORT")
-            lev = round(max(0.5, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
 
             self._trailing_stop = price + (atr * 2.5)
             self._best_price = price
@@ -504,6 +523,104 @@ class SqueezeV13:
                 "signal": f"V13_BO_S(s{score},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
                 "stop": price + (atr * 2.5),
                 "target": price - (atr * 12),
+                "leverage": lev,
+            }
+
+        return None
+
+    def _try_trend(self, data, i, regime):
+        """Trend-following in strong trending regimes. Trades WITH the trend."""
+        ind = self._ind.iloc[i]
+        price = float(ind["close"])
+        atr = float(ind["atr"])
+        atr_pct = float(ind["atr_pct"])
+        rsi = float(ind["rsi"])
+        adx = float(ind["adx"]) if not pd.isna(ind["adx"]) else 15.0
+        vol_ratio = float(ind["vol_ratio"])
+
+        # Only trade in strong trends (ADX > 35)
+        if adx < 35:
+            return None
+
+        # Skip on weak candles
+        if ind["weak_candle"] == 1:
+            return None
+
+        # Need decent volume
+        if vol_ratio < 1.0:
+            return None
+
+        # Cap volatility
+        if atr_pct > 4.0:
+            return None
+
+        trend = self._daily_trend(i)
+
+        # LONG: strong uptrend + pullback to EMA21
+        if (trend == "UP" and
+            ind["ema8"] > ind["ema21"] > ind["ema55"] and
+            price > ind["ema21"] and  # above EMA21
+            price <= ind["ema21"] * 1.01 and  # but close to it (within 1%)
+            rsi > 40 and rsi < 65 and  # not overbought, not oversold
+            ind["bullish"] == 1 and
+            ind["body_ratio"] > 0.4):
+
+            if not self._direction_allowed("LONG", i, regime):
+                return None
+            if self._btc_crashed(data.index[i]):
+                return None
+
+            stop = price - (atr * 2.0)
+            target = price + (atr * 6.0)
+
+            kelly_lev = self._compute_kelly("LONG")
+            regime_mult = 1.3  # conservative in trending
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+
+            self._trailing_stop = stop
+            self._best_price = price
+            self._entry_bar = i
+            self._trade_type = "breakout"  # use breakout exit logic
+
+            return {
+                "action": "LONG",
+                "signal": f"V13_TF_L(adx{adx:.0f},rsi{rsi:.0f},l{lev:.1f}x)",
+                "stop": stop,
+                "target": target,
+                "leverage": lev,
+            }
+
+        # SHORT: strong downtrend + pullback to EMA21
+        if (trend == "DOWN" and
+            ind["ema8"] < ind["ema21"] < ind["ema55"] and
+            price < ind["ema21"] and  # below EMA21
+            price >= ind["ema21"] * 0.99 and  # but close to it (within 1%)
+            rsi > 35 and rsi < 60 and  # not oversold, not overbought
+            ind["bullish"] == 0 and
+            ind["body_ratio"] > 0.4):
+
+            if not self._direction_allowed("SHORT", i, regime):
+                return None
+
+            stop = price + (atr * 2.0)
+            target = price - (atr * 6.0)
+
+            kelly_lev = self._compute_kelly("SHORT")
+            regime_mult = 1.3
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+
+            self._trailing_stop = stop
+            self._best_price = price
+            self._entry_bar = i
+            self._trade_type = "breakout"
+
+            return {
+                "action": "SHORT",
+                "signal": f"V13_TF_S(adx{adx:.0f},rsi{rsi:.0f},l{lev:.1f}x)",
+                "stop": stop,
+                "target": target,
                 "leverage": lev,
             }
 
@@ -539,7 +656,7 @@ class SqueezeV13:
                 return None
 
             stop = price - (atr * self.mr_stop_atr)
-            # Target beyond BB mid — aim for 60% of the way to upper BB
+            # Target beyond BB mid — aim for 70% of the way to upper BB
             target = bb_mid + (bb_upper - bb_mid) * 0.7
 
             gain_dist = target - price
@@ -549,7 +666,8 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("LONG")
             regime_mult = self._regime_leverage_mult(regime, trend, "LONG")
-            lev = round(max(0.5, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
 
             self._trailing_stop = stop
             self._best_price = price
@@ -575,7 +693,7 @@ class SqueezeV13:
                 return None
 
             stop = price + (atr * self.mr_stop_atr)
-            # Target beyond BB mid — aim for 60% of the way to lower BB
+            # Target beyond BB mid — aim for 70% of the way to lower BB
             target = bb_mid - (bb_mid - bb_lower) * 0.7
 
             gain_dist = price - target
@@ -585,7 +703,8 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("SHORT")
             regime_mult = self._regime_leverage_mult(regime, trend, "SHORT")
-            lev = round(max(0.5, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
 
             self._trailing_stop = stop
             self._best_price = price

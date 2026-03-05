@@ -887,7 +887,7 @@ class SqueezeV14:
         vwap_dist = float(ind["vwap_dist"]) if not pd.isna(ind["vwap_dist"]) else 0
 
         # Per-asset MR target extension (% of way to opposite band)
-        MR_TARGET_EXT = {"BTC": 0.7, "ETH": 0.7, "SOL": 0.7, "LINK": 0.85}
+        MR_TARGET_EXT = {"BTC": 0.7, "ETH": 0.7, "SOL": 0.7, "LINK": 0.90}
         mr_target_pct = MR_TARGET_EXT.get(self.asset_name, 0.7)
 
         # LONG: price near lower BB + RSI oversold + Williams %R oversold + bullish candle
@@ -1369,12 +1369,17 @@ class SqueezeV14:
                     self._last_exit_bar = i
                     return "TIME_EXIT"
 
-        # Trailing stop
+        # Trailing stop — V14: per-asset trail width
+        TRAIL_BASE = {"BTC": 2.5, "ETH": 2.5, "SOL": 2.5, "LINK": 3.0}
+        TRAIL_DECAY = {"BTC": 0.08, "ETH": 0.08, "SOL": 0.08, "LINK": 0.06}
+        trail_base = TRAIL_BASE.get(self.asset_name, 2.5)
+        trail_decay = TRAIL_DECAY.get(self.asset_name, 0.08)
+
         if trade.direction == "LONG":
             if price > (self._best_price or price):
                 self._best_price = price
                 pnl_r = (price - trade.entry_price) / atr
-                trail = max(1.0, 2.5 - pnl_r * 0.08)
+                trail = max(1.0, trail_base - pnl_r * trail_decay)
                 new_trail = price - (atr * trail)
                 if new_trail > (self._trailing_stop or 0):
                     self._trailing_stop = new_trail
@@ -1392,7 +1397,7 @@ class SqueezeV14:
             if price < (self._best_price or price):
                 self._best_price = price
                 pnl_r = (trade.entry_price - price) / atr
-                trail = max(1.0, 2.5 - pnl_r * 0.08)
+                trail = max(1.0, trail_base - pnl_r * trail_decay)
                 new_trail = price + (atr * trail)
                 if new_trail < (self._trailing_stop or float('inf')):
                     self._trailing_stop = new_trail

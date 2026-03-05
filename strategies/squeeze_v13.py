@@ -33,6 +33,22 @@ ASSET_KELLY = {
     "LINK": 0.50,
 }
 
+# Per-asset MR stop ATR multiplier
+ASSET_MR_STOP = {
+    "BTC": 1.2,
+    "ETH": 1.0,
+    "SOL": 1.0,
+    "LINK": 1.5,
+}
+
+# Per-asset MR RSI thresholds (tighter = fewer but higher quality trades)
+ASSET_MR_RSI = {
+    "BTC": (38, 62),
+    "ETH": (38, 62),
+    "SOL": (38, 62),
+    "LINK": (35, 65),
+}
+
 # Per-asset BB period (BTC/LINK better with shorter, ETH/SOL with standard)
 ASSET_BB_PERIOD = {
     "BTC": 16,
@@ -92,12 +108,13 @@ class SqueezeV13:
         self.atr_volatile_pctile = atr_volatile_pctile / 100.0
         self.bb_width_sideways_ratio = bb_width_sideways_ratio
 
-        # Mean reversion — per-asset BB period
+        # Mean reversion — per-asset BB period and RSI
         self.mr_bb_period = ASSET_BB_PERIOD.get(asset_name, mr_bb_period)
-        self.mr_rsi_long = mr_rsi_long
-        self.mr_rsi_short = mr_rsi_short
+        rsi_thresholds = ASSET_MR_RSI.get(asset_name, (mr_rsi_long, mr_rsi_short))
+        self.mr_rsi_long = rsi_thresholds[0]
+        self.mr_rsi_short = rsi_thresholds[1]
         self.mr_bb_entry_pct = mr_bb_entry_pct
-        self.mr_stop_atr = mr_stop_atr
+        self.mr_stop_atr = ASSET_MR_STOP.get(asset_name, mr_stop_atr)
 
         # Breakout
         self.bo_rsi_long = bo_rsi_long
@@ -794,7 +811,7 @@ class SqueezeV13:
         if i - self._entry_bar >= 10:
             if trade.direction == "LONG":
                 pnl_r = (price - trade.entry_price) / atr
-                if pnl_r < 0.5:  # only exit if not meaningfully profitable
+                if pnl_r < 0.5:
                     self._last_exit_bar = i
                     return "MR_TIME_EXIT"
             elif trade.direction == "SHORT":

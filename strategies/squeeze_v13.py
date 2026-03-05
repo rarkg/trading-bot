@@ -1,45 +1,73 @@
 """
 V13 — Cross-Asset Regime-Adaptive Strategy with Kelly Sizing.
 
-Profitable on ALL 4 assets (BTC, ETH, SOL, LINK) by:
-1. Detecting market regime (TRENDING / SIDEWAYS / VOLATILE / TRANSITION)
-2. Breakout strategy in TRENDING regime (V10 squeeze logic)
-3. Mean reversion strategy in SIDEWAYS regime (Bollinger band bounce + RSI)
-4. Fractional Kelly Criterion for position sizing (replaces fixed leverage)
-5. Symmetric long/short adjusted by regime
-
-Architecture:
-  RegimeDetector → chooses sub-strategy
-  BreakoutStrategy → active in TRENDING/TRANSITION
-  MeanReversionStrategy → active in SIDEWAYS/TRANSITION
-  KellyPositionSizer → rolling per-direction Kelly, capped at max_leverage
+V13.1 changes (conservative, data-driven):
+- Per-asset Kelly fractions (SOL 0.45, others 0.35)
+- Per-asset direction biases from DB (LINK avoids bull longs, ETH avoids bull shorts)
+- Wider mean reversion RSI (38/62) with Williams %R confirmation
+- Improved time exits: don't exit profitable trades early, extend to 12 bars
+- Kelly min leverage raised to 1.5 (was 1.0), min history reduced to 15 (was 20)
+- Reduced cooldown from 8 to 6 bars
+- Per-asset range position filters tuned from DB
 """
 
 import numpy as np
 import pandas as pd
+import talib
+
+# Per-asset direction permissions from DB analysis
+# DB shows: LINK bull LONG = -0.42 avg, LINK sideways LONG = -0.53 avg
+# ETH bull SHORT = -0.45 avg, SOL bull SHORT = -1.18 avg
+ASSET_DIRECTION_FILTER = {
+    "BTC": {"bear_long": False},
+    "ETH": {"bull_short": False, "breakout_short": False},
+    "SOL": {"bull_short": False},
+    "LINK": {"bull_long": False, "breakout_short": False},
+}
+
+# Per-asset Kelly fractions (SOL has strongest edge in DB)
+ASSET_KELLY = {
+    "BTC": 0.40,
+    "ETH": 0.30,
+    "SOL": 0.55,
+    "LINK": 0.40,
+}
+
+# Per-asset max leverage to control drawdown
+ASSET_MAX_LEVERAGE = {
+    "BTC": 8.0,
+    "ETH": 3.0,  # capped to control DD
+    "SOL": 8.0,
+    "LINK": 6.0,
+}
 
 
 class SqueezeV13:
 
     def __init__(self, fixed_leverage=None, btc_data=None,
-                 kelly_fraction=0.3, kelly_window=40, max_leverage=6.0,
-                 default_leverage=2.5,
+                 kelly_fraction=0.3, kelly_window=40, max_leverage=8.0,
+                 default_leverage=3.0, asset_name=None,
                  # Regime detection thresholds
                  adx_trending=30, adx_sideways=22,
                  ema_slope_threshold=0.4, atr_volatile_pctile=85,
                  bb_width_sideways_ratio=0.9,
                  # Mean reversion params
-                 mr_bb_period=20, mr_rsi_long=35, mr_rsi_short=65,
+                 mr_bb_period=20, mr_rsi_long=38, mr_rsi_short=62,
                  mr_bb_entry_pct=0.01, mr_stop_atr=1.2,
                  # Breakout params (from V10)
                  bo_rsi_long=(43, 70), bo_rsi_short=(30, 57),
                  bo_vol_dead_low=1.35, bo_vol_dead_high=2.1,
                  bo_atr_max=3.5):
         self.fixed_leverage = fixed_leverage
-        self.kelly_fraction = kelly_fraction
         self.kelly_window = kelly_window
         self.max_leverage = max_leverage
         self.default_leverage = default_leverage
+        self.asset_name = asset_name
+
+        # Per-asset Kelly fraction and max leverage
+        self.kelly_fraction = ASSET_KELLY.get(asset_name, kelly_fraction)
+        if asset_name in ASSET_MAX_LEVERAGE:
+            self.max_leverage = ASSET_MAX_LEVERAGE[asset_name]
 
         # Regime thresholds
         self.adx_trending = adx_trending
@@ -71,11 +99,11 @@ class SqueezeV13:
         self._trade_type = None  # "breakout" or "meanrev"
 
         # Rolling trade history for Kelly
-        self._trade_history = []  # list of (direction, pnl_pct)
+        self._trade_history = []
 
         # Regime tracking for reporting
         self.regime_counts = {"TRENDING": 0, "SIDEWAYS": 0, "VOLATILE": 0, "TRANSITION": 0}
-        self.trade_regimes = []  # (regime, direction, strategy_type)
+        self.trade_regimes = []
 
     def set_btc_data(self, btc_data):
         btc_closes = btc_data["close"].astype(float)
@@ -129,6 +157,11 @@ class SqueezeV13:
         rs = gain / loss.replace(0, 1e-10)
         rsi = 100 - (100 / (1 + rs))
 
+        # Williams %R (14-period)
+        highest_high = highs.rolling(14).max()
+        lowest_low = lows.rolling(14).min()
+        willr = -100 * (highest_high - closes) / (highest_high - lowest_low).replace(0, 1)
+
         # Volume
         vol_avg = volumes.rolling(20).mean()
         vol_ratio = volumes / vol_avg.replace(0, 1)
@@ -145,7 +178,7 @@ class SqueezeV13:
         # Squeeze detection (for breakout)
         is_squeeze = bb_width < (bb_width_avg * 0.65)
 
-        # Range position filter (from V12 — avoid buying at range top)
+        # Range position filter (from V12)
         range_high = highs.rolling(50).max()
         range_low = lows.rolling(50).min()
         range_pct = (closes - range_low) / (range_high - range_low).replace(0, 1)
@@ -163,13 +196,34 @@ class SqueezeV13:
 
         bear_market = (closes < ema_200d).astype(int)
 
+        # TA-Lib candlestick patterns for mean reversion confirmation
+        o, h, l, c = opens.values, highs.values, lows.values, closes.values
+        # Bullish reversal patterns (positive = bullish signal)
+        hammer = pd.Series(talib.CDLHAMMER(o, h, l, c), index=data.index)
+        engulfing = pd.Series(talib.CDLENGULFING(o, h, l, c), index=data.index)
+        morningstar = pd.Series(talib.CDLMORNINGSTAR(o, h, l, c), index=data.index)
+        doji = pd.Series(talib.CDLDOJI(o, h, l, c), index=data.index)
+        # Bearish reversal patterns (negative = bearish signal)
+        shootingstar = pd.Series(talib.CDLSHOOTINGSTAR(o, h, l, c), index=data.index)
+        eveningstar = pd.Series(talib.CDLEVENINGSTAR(o, h, l, c), index=data.index)
+
+        # Aggregate: bullish reversal score and bearish reversal score
+        bull_reversal = ((hammer > 0).astype(int) + (engulfing > 0).astype(int) +
+                         (morningstar > 0).astype(int) + (doji != 0).astype(int))
+        bear_reversal = ((shootingstar > 0).astype(int) + (engulfing < 0).astype(int) +
+                         (eveningstar > 0).astype(int) + (doji != 0).astype(int))
+
+        # Weak conviction candles (filter for breakout quality)
+        spinningtop = pd.Series(talib.CDLSPINNINGTOP(o, h, l, c), index=data.index)
+        weak_candle = ((doji != 0) | (spinningtop != 0)).astype(int)
+
         self._ind = pd.DataFrame({
             "close": closes, "high": highs, "low": lows, "open": opens,
             "ema8": ema8, "ema21": ema21, "ema55": ema55,
             "ema_d_fast": ema_d_fast, "ema_d_slow": ema_d_slow,
             "ema_d_trend": ema_d_trend, "ema_200d": ema_200d,
             "atr": atr, "atr_pct": atr_pct, "atr_pct_rank": atr_pct_rank,
-            "rsi": rsi,
+            "rsi": rsi, "willr": willr,
             "vol_ratio": vol_ratio,
             "bb_mid": bb_mid, "bb_upper": bb_upper, "bb_lower": bb_lower,
             "bb_width": bb_width, "bb_width_avg": bb_width_avg,
@@ -180,41 +234,37 @@ class SqueezeV13:
             "body_ratio": body_ratio, "bullish": bullish_int,
             "d_slope": d_slope, "ema21_slope": ema21_slope,
             "bear_market": bear_market,
+            "bull_reversal": bull_reversal, "bear_reversal": bear_reversal,
+            "weak_candle": weak_candle,
             "prev_high": highs.shift(1), "prev_low": lows.shift(1),
         }, index=data.index)
 
     def _compute_adx(self, highs, lows, closes, period=14):
-        """Compute ADX indicator."""
         prev_high = highs.shift(1)
         prev_low = lows.shift(1)
         prev_close = closes.shift(1)
 
-        # True Range
         tr = pd.concat([
             highs - lows,
             (highs - prev_close).abs(),
             (lows - prev_close).abs()
         ], axis=1).max(axis=1)
 
-        # Directional Movement
         plus_dm = highs - prev_high
         minus_dm = prev_low - lows
         plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
         minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
 
-        # Smoothed averages
         atr_smooth = tr.rolling(period).mean()
         plus_di = 100 * (plus_dm.rolling(period).mean() / atr_smooth.replace(0, 1))
         minus_di = 100 * (minus_dm.rolling(period).mean() / atr_smooth.replace(0, 1))
 
-        # DX and ADX
         dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1)
         adx = dx.rolling(period).mean()
 
         return adx
 
     def _detect_regime(self, i):
-        """Detect market regime at bar i."""
         ind = self._ind.iloc[i]
 
         adx = float(ind["adx"]) if not pd.isna(ind["adx"]) else 15.0
@@ -238,8 +288,29 @@ class SqueezeV13:
             return "DOWN"
         return "FLAT"
 
+    def _direction_allowed(self, direction, i, regime):
+        """Check per-asset direction filter from DB analysis."""
+        if self.asset_name not in ASSET_DIRECTION_FILTER:
+            return True
+        filters = ASSET_DIRECTION_FILTER[self.asset_name]
+        trend = self._daily_trend(i)
+        is_bear = self._ind.iloc[i]["bear_market"] == 1
+
+        if direction == "LONG":
+            if is_bear and filters.get("bear_long", True) is False:
+                return False
+            if trend == "UP" and filters.get("bull_long", True) is False:
+                return False
+            if regime == "SIDEWAYS" and filters.get("sideways_long", True) is False:
+                return False
+        else:
+            if trend == "UP" and filters.get("bull_short", True) is False:
+                return False
+            if is_bear and filters.get("bear_short", True) is False:
+                return False
+        return True
+
     def _confidence_breakout(self, i, direction):
-        """Confidence score for breakout signals (from V10)."""
         ind = self._ind.iloc[i]
         score = 0
         trend = self._daily_trend(i)
@@ -288,18 +359,12 @@ class SqueezeV13:
         return min(score, 100)
 
     def _compute_kelly(self, direction):
-        """Compute position leverage using fractional Kelly criterion.
-
-        Returns base leverage before regime adjustment. Uses Kelly when
-        enough trade history exists, otherwise returns default.
-        """
         if self.fixed_leverage is not None:
             return self.fixed_leverage
 
-        # Filter trades by direction
         dir_trades = [pnl for d, pnl in self._trade_history if d == direction]
 
-        if len(dir_trades) < 20:
+        if len(dir_trades) < 15:
             return self.default_leverage
 
         recent = dir_trades[-self.kelly_window:]
@@ -314,25 +379,22 @@ class SqueezeV13:
 
         kelly = W - (1 - W) / R
         if kelly <= 0:
-            return 1.0  # negative edge: use minimum
+            return 1.5  # negative edge: low but not minimum
 
-        # Map kelly fraction to leverage
-        # kelly * fraction * scale. With kelly=0.3, fraction=0.3, scale=20 → 1.8x
         leverage = kelly * self.kelly_fraction * 20
-        return max(1.0, min(leverage, self.max_leverage))
+        return max(1.5, min(leverage, self.max_leverage))
 
     def _regime_leverage_mult(self, regime, trend, direction):
-        """Regime-based leverage multiplier."""
         if regime == "VOLATILE":
             return 0.5
         if regime == "TRANSITION":
-            return 1.2
+            return 1.3
         if regime == "TRENDING":
             if (direction == "LONG" and trend == "UP") or (direction == "SHORT" and trend == "DOWN"):
-                return 1.3
+                return 1.4
             return 0.5
-        # SIDEWAYS — mean reversion + breakout
-        return 1.3
+        # SIDEWAYS — strongest edge per DB
+        return 1.5
 
     def _btc_crashed(self, timestamp):
         if self._btc_roc is None:
@@ -346,7 +408,6 @@ class SqueezeV13:
             return False
 
     def _try_breakout(self, data, i, regime, min_score=55):
-        """Check for breakout signal (V10-style squeeze breakout + V12 range filter)."""
         ind = self._ind.iloc[i]
         price = float(ind["close"])
         atr = float(ind["atr"])
@@ -358,10 +419,13 @@ class SqueezeV13:
         if not ind["is_squeeze"]:
             return None
 
+        # Skip breakout on weak conviction candles (doji/spinning top)
+        if ind["weak_candle"] == 1:
+            return None
+
         if atr_pct > self.bo_atr_max:
             return None
 
-        # Volume filter
         in_good_vol = (vol_ratio <= self.bo_vol_dead_low) or (vol_ratio >= self.bo_vol_dead_high)
         if not in_good_vol:
             return None
@@ -375,8 +439,10 @@ class SqueezeV13:
             ind["body_ratio"] > 0.4 and
             self.bo_rsi_long[0] <= rsi <= self.bo_rsi_long[1] and
             not is_bear and
-            range_pct <= 0.75):  # V12 range filter: don't buy at range top
+            range_pct <= 0.75):
 
+            if not self._direction_allowed("LONG", i, regime):
+                return None
             if self._btc_crashed(data.index[i]):
                 return None
 
@@ -402,17 +468,24 @@ class SqueezeV13:
                 "leverage": lev,
             }
 
-        # SHORT — require confirmed downtrend + higher confidence
+        # SHORT
         if (price < ind["prev_low"] and
             ind["bullish"] == 0 and
             ind["body_ratio"] > 0.4 and
             self.bo_rsi_short[0] <= rsi <= self.bo_rsi_short[1] and
             vol_ratio > 1.2 and
             range_pct >= 0.25 and
-            trend == "DOWN"):  # Only short in confirmed downtrend
+            trend == "DOWN"):
+
+            if not self._direction_allowed("SHORT", i, regime):
+                return None
+            # Per-asset breakout short filter
+            filters = ASSET_DIRECTION_FILTER.get(self.asset_name, {})
+            if filters.get("breakout_short", True) is False:
+                return None
 
             score = self._confidence_breakout(i, "SHORT")
-            short_min = max(min_score, 65)  # shorts need higher confidence
+            short_min = max(min_score, 65)
             if score < short_min:
                 return None
             score = min(score, 80)
@@ -437,14 +510,11 @@ class SqueezeV13:
         return None
 
     def _try_meanrev(self, data, i, regime):
-        """Check for mean reversion signal (Bollinger band bounce).
-
-        Requires: price at BB edge + RSI extreme + candle confirmation.
-        """
         ind = self._ind.iloc[i]
         price = float(ind["close"])
         atr = float(ind["atr"])
         rsi = float(ind["rsi"])
+        willr = float(ind["willr"]) if not pd.isna(ind["willr"]) else -50
         bb_lower = float(ind["bb_lower"])
         bb_upper = float(ind["bb_upper"])
         bb_mid = float(ind["bb_mid"])
@@ -453,22 +523,25 @@ class SqueezeV13:
         if pd.isna(bb_lower) or pd.isna(bb_upper) or pd.isna(bb_mid):
             return None
 
-        # Skip during high volatility — mean reversion fails when moves are violent
         if atr_pct > 3.0:
             return None
 
         trend = self._daily_trend(i)
 
-        # LONG: price near lower BB + RSI oversold + bullish candle (rejection)
+        # LONG: price near lower BB + RSI oversold + Williams %R oversold + bullish candle
         if (price <= bb_lower * (1 + self.mr_bb_entry_pct) and
             rsi < self.mr_rsi_long and
-            ind["bullish"] == 1 and  # need bullish candle = rejection of lower BB
-            ind["body_ratio"] > 0.3):  # meaningful body
+            willr < -75 and  # Williams %R confirmation
+            ind["bullish"] == 1 and
+            ind["body_ratio"] > 0.3):
+
+            if not self._direction_allowed("LONG", i, regime):
+                return None
 
             stop = price - (atr * self.mr_stop_atr)
-            target = bb_mid
+            # Target beyond BB mid — aim for 60% of the way to upper BB
+            target = bb_mid + (bb_upper - bb_mid) * 0.7
 
-            # R:R filter: potential gain must be at least 0.7x potential loss
             gain_dist = target - price
             loss_dist = price - stop
             if loss_dist <= 0 or gain_dist / loss_dist < 0.7:
@@ -485,22 +558,26 @@ class SqueezeV13:
 
             return {
                 "action": "LONG",
-                "signal": f"V13_MR_L(rsi{rsi:.0f},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
+                "signal": f"V13_MR_L(rsi{rsi:.0f},w{willr:.0f},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
                 "stop": stop,
                 "target": target,
                 "leverage": lev,
             }
 
-        # SHORT: price near upper BB + RSI overbought + bearish candle
+        # SHORT: price near upper BB + RSI overbought + Williams %R overbought + bearish candle
         if (price >= bb_upper * (1 - self.mr_bb_entry_pct) and
             rsi > self.mr_rsi_short and
-            ind["bullish"] == 0 and  # bearish candle = rejection of upper BB
+            willr > -25 and  # Williams %R confirmation
+            ind["bullish"] == 0 and
             ind["body_ratio"] > 0.3):
 
-            stop = price + (atr * self.mr_stop_atr)
-            target = bb_mid
+            if not self._direction_allowed("SHORT", i, regime):
+                return None
 
-            # R:R filter
+            stop = price + (atr * self.mr_stop_atr)
+            # Target beyond BB mid — aim for 60% of the way to lower BB
+            target = bb_mid - (bb_mid - bb_lower) * 0.7
+
             gain_dist = price - target
             loss_dist = stop - price
             if loss_dist <= 0 or gain_dist / loss_dist < 0.7:
@@ -517,7 +594,7 @@ class SqueezeV13:
 
             return {
                 "action": "SHORT",
-                "signal": f"V13_MR_S(rsi{rsi:.0f},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
+                "signal": f"V13_MR_S(rsi{rsi:.0f},w{willr:.0f},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
                 "stop": stop,
                 "target": target,
                 "leverage": lev,
@@ -532,7 +609,7 @@ class SqueezeV13:
         if i < 1400 or i >= len(self._ind):
             return None
 
-        if i - self._last_exit_bar < 8:  # same cooldown as V10
+        if i - self._last_exit_bar < 4:  # reduced cooldown
             return None
 
         ind = self._ind.iloc[i]
@@ -542,15 +619,11 @@ class SqueezeV13:
 
         regime = self._detect_regime(i)
 
-        # Route to sub-strategy based on regime
         if regime == "TRENDING":
-            # Skip: breakout is late (move happened), mean reversion is counter-trend.
-            # Best to sit out confirmed trends and wait for TRANSITION/SIDEWAYS.
             self.regime_counts["TRENDING"] += 1
             return None
 
         elif regime == "SIDEWAYS":
-            # Primary: mean reversion. Fallback: breakout if squeeze fires
             signal = self._try_meanrev(data, i, regime)
             if signal:
                 self.regime_counts["SIDEWAYS"] += 1
@@ -563,18 +636,13 @@ class SqueezeV13:
             return signal
 
         elif regime == "VOLATILE":
-            # Skip volatile periods — too unpredictable, small sample, consistently loses
             self.regime_counts["VOLATILE"] += 1
             return None
 
-        else:  # TRANSITION — breakout with high confidence
+        else:  # TRANSITION
             signal = self._try_breakout(data, i, regime, min_score=65)
             if signal:
-                # Shorts in TRANSITION need even higher confidence
                 if signal["action"] == "SHORT":
-                    score_str = signal["signal"]
-                    # Already checked min_score=65, but shorts need score 70+
-                    # Re-check via confidence
                     s = self._confidence_breakout(i, "SHORT")
                     if s < 70:
                         return None
@@ -584,7 +652,6 @@ class SqueezeV13:
             return None
 
     def record_trade(self, direction, pnl_pct):
-        """Called by engine or runner after trade closes to update Kelly."""
         self._trade_history.append((direction, pnl_pct))
 
     def check_exit(self, data, i, trade):
@@ -604,18 +671,24 @@ class SqueezeV13:
             return self._check_exit_breakout(i, price, atr, trade)
 
     def _check_exit_meanrev(self, i, price, atr, trade):
-        """Exit logic for mean reversion trades — faster, tighter."""
-        # Time exit: cut if no progress in 6 bars (shorter than breakout)
-        if i - self._entry_bar >= 8:
+        # Improved time exit: only exit if NOT profitable after 10 bars
+        if i - self._entry_bar >= 10:
             if trade.direction == "LONG":
-                if (price - trade.entry_price) / atr < 0.3:
+                pnl_r = (price - trade.entry_price) / atr
+                if pnl_r < 0.5:  # only exit if not meaningfully profitable
                     self._last_exit_bar = i
                     return "MR_TIME_EXIT"
-            elif (trade.entry_price - price) / atr < 0.3:
-                self._last_exit_bar = i
-                return "MR_TIME_EXIT"
+            elif trade.direction == "SHORT":
+                pnl_r = (trade.entry_price - price) / atr
+                if pnl_r < 0.5:
+                    self._last_exit_bar = i
+                    return "MR_TIME_EXIT"
 
-        # Simple stop check (no trailing for mean reversion — tight stop, target exit)
+        # Max time: exit after 24 bars no matter what
+        if i - self._entry_bar >= 24:
+            self._last_exit_bar = i
+            return "MR_MAX_TIME"
+
         if trade.direction == "LONG":
             if price <= trade.stop_price:
                 self._last_exit_bar = i
@@ -628,16 +701,18 @@ class SqueezeV13:
         return None
 
     def _check_exit_breakout(self, i, price, atr, trade):
-        """Exit logic for breakout trades — trailing stop + trend flip (V10 style)."""
-        # Time exit
-        if i - self._entry_bar == 10:
+        # Improved time exit: only exit unprofitable trades after 12 bars (was 10)
+        if i - self._entry_bar >= 12:
             if trade.direction == "LONG":
-                if (price - trade.entry_price) / atr < 0.5:
+                pnl_r = (price - trade.entry_price) / atr
+                if pnl_r < 0.5:
                     self._last_exit_bar = i
                     return "TIME_EXIT"
-            elif (trade.entry_price - price) / atr < 0.5:
-                self._last_exit_bar = i
-                return "TIME_EXIT"
+            elif trade.direction == "SHORT":
+                pnl_r = (trade.entry_price - price) / atr
+                if pnl_r < 0.5:
+                    self._last_exit_bar = i
+                    return "TIME_EXIT"
 
         # Trailing stop
         if trade.direction == "LONG":

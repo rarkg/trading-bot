@@ -249,7 +249,7 @@ def main():
     for sym in ASSETS:
         data = datasets[sym]
         engine = V13Engine(initial_capital=1000, fee_pct=0.045, max_risk_pct=5.0)
-        strat = SqueezeV13(btc_data=btc_data)
+        strat = SqueezeV13(btc_data=btc_data, asset_name=sym)
         if sym != "BTC":
             strat.set_btc_data(btc_data)
 
@@ -338,7 +338,7 @@ def main():
 
         # Train
         engine_tr = V13Engine(initial_capital=1000, fee_pct=0.045, max_risk_pct=5.0)
-        strat_tr = SqueezeV13(btc_data=btc_data)
+        strat_tr = SqueezeV13(btc_data=btc_data, asset_name=sym)
         if sym != "BTC":
             strat_tr.set_btc_data(btc_data)
         r_tr, _ = engine_tr.run_with_kelly_feedback(train_data, strat_tr, f"{sym} Train")
@@ -346,7 +346,7 @@ def main():
 
         # Test (fresh strategy)
         engine_te = V13Engine(initial_capital=1000, fee_pct=0.045, max_risk_pct=5.0)
-        strat_te = SqueezeV13(btc_data=btc_data)
+        strat_te = SqueezeV13(btc_data=btc_data, asset_name=sym)
         if sym != "BTC":
             strat_te.set_btc_data(btc_data)
         r_te, _ = engine_te.run_with_kelly_feedback(test_data, strat_te, f"{sym} Test")

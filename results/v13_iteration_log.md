@@ -146,7 +146,50 @@ All 4 OOS pass! BTC OOS fixed from V13.6 (was FAIL -0.54, now +0.69).
 9. **LINK max leverage**: 8.0 (from 6.0)
 10. **Max risk per trade**: 8% (from 5%)
 
-## All Key Lessons (V13.0 to V13.11)
+## V13.12 — Round 3: Creative Features + Per-Asset Optimization — 6.56%/mo avg!
+
+**New features implemented:**
+1. **VWAP (rolling 24h)** — computed as indicator; used for VWAP bounce entries
+2. **Multi-timeframe (4h EMA slope)** — used in unified confidence scoring
+3. **Volatility clustering (ATR ratio)** — used in confidence scoring
+4. **Unified confidence score** — combines MTF, VWAP, volume, vol clustering, candle patterns, BTC health → leverage multiplier (BTC/ETH/LINK only)
+5. **VWAP bounce entries** — new signal type for ETH (TRANSITION) and LINK (TRANSITION + SIDEWAYS)
+6. **Breakeven stop** — after 2 ATR profit, move stop to entry + 0.5 ATR (breakout only)
+7. **Overextension MR** — RSI < 15 / > 85 entries in all regimes (rarely fires)
+8. **Per-asset leverage optimization** — BTC default 4.5x/max 12x, ETH max 6x, LINK default 6x/max 12x
+
+| Asset | %/mo | DD | PF | Trades | vs V13.11 |
+|-------|------|-----|-----|--------|-----------|
+| BTC | +3.17 | 19.3% | 1.62 | 123 | +1.42 |
+| ETH | +3.29 | 21.6% | 2.46 | 104 | +1.92 |
+| SOL | +16.41 | 23.4% | 2.44 | 106 | +0.96 |
+| LINK | +3.38 | 12.2% | 3.77 | 30 | +1.78 |
+| **Avg** | **+6.56** | | | | **+1.52** |
+
+**OOS Validation**: All 4 pass (BTC +0.51, ETH +5.16, SOL +4.30, LINK +2.38)
+
+**What worked:**
+- VWAP bounce for ETH: +1.32%/mo improvement (ETH 1.37→2.69 before leverage)
+- VWAP bounce for LINK: +0.33%/mo from new trades in SIDEWAYS
+- Per-asset leverage: BTC default 4.5x/max 12x pushed from 1.95→3.17
+- ETH max leverage 5→6x pushed from 2.69→3.29
+- LINK default 6x/max 12x pushed from 1.63→3.38
+- Breakeven stop improved SOL win rate (44→45%) and ETH win rate (42→49%)
+- Unified confidence score for BTC added +0.42%/mo via selective leverage boost
+
+**What failed (tried and reverted):**
+- VWAP as breakout direction filter — cut good trades
+- MTF as confidence booster in breakout score — lowered quality bar
+- Wider SIDEWAYS regime detection — floods bad MR trades
+- MR in TRANSITION regime — 462 trades for BTC, all garbage
+- Aggressive overextension (RSI < 18) — too many bad trades
+- Tight breakeven (1 ATR) — killed SOL big winners
+- LINK bull_long permission removal — DD exploded to 46%
+- BTC bear_long removal + VB — worse quality
+- Lower LINK min_score — added losers
+- Confidence multiplier for all assets — DD explosion
+
+## All Key Lessons (V13.0 to V13.12)
 - **Don't add trade types blindly** — trend following and MR-in-transition both failed badly
 - **Regime filtering is correct** — the MR edge ONLY exists in SIDEWAYS. Don't try to expand.
 - **Per-asset optimization is the key** — BB period, RSI, stops, targets all asset-specific
@@ -155,3 +198,8 @@ All 4 OOS pass! BTC OOS fixed from V13.6 (was FAIL -0.54, now +0.69).
 - **Kelly fraction undersizing** was the biggest drag on BTC/ETH/LINK performance
 - **Don't over-optimize cooldown** — 4 bars is the sweet spot, 2 bars adds bad trades
 - **MR trailing stops hurt more than help** — MR trades should reach target or stop, not trail
+- **VWAP bounce is asset-specific** — great for ETH/LINK, terrible for BTC/SOL
+- **Confidence multipliers need DD budget** — only apply to assets with DD headroom
+- **Per-asset default leverage is crucial** — LINK went from 1.63→3.38 just from default 3→6
+- **Leverage boost > new signals for BTC** — BTC gains came from sizing, not new entries
+- **Breakeven stop must be generous** — 2 ATR threshold with 0.5 ATR buffer, not 1 ATR

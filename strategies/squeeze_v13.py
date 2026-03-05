@@ -30,7 +30,7 @@ ASSET_KELLY = {
     "BTC": 0.55,
     "ETH": 0.45,
     "SOL": 0.55,
-    "LINK": 0.50,
+    "LINK": 0.65,  # high quality signal — bet more
 }
 
 # Per-asset breakout stop/target ATR multipliers
@@ -74,7 +74,7 @@ ASSET_BB_PERIOD = {
 
 # Per-asset minimum leverage floors (positive-edge assets shouldn't go below this)
 ASSET_MIN_LEVERAGE = {
-    "BTC": 2.5,
+    "BTC": 3.0,
     "ETH": 2.0,
     "SOL": 3.0,
     "LINK": 2.5,
@@ -82,10 +82,10 @@ ASSET_MIN_LEVERAGE = {
 
 # Per-asset max leverage to control drawdown
 ASSET_MAX_LEVERAGE = {
-    "BTC": 8.0,
-    "ETH": 5.0,  # raised from 4.0
+    "BTC": 12.0,  # DD 14.2% — room to push further
+    "ETH": 6.0,  # pushed from 5.0 — DD 20% has room
     "SOL": 8.0,
-    "LINK": 8.0,  # raised from 6.0 — was capping 58% of trades
+    "LINK": 12.0,  # DD only 11.1% — massive room to lever up
 }
 
 
@@ -108,7 +108,9 @@ class SqueezeV13:
         self.fixed_leverage = fixed_leverage
         self.kelly_window = kelly_window
         self.max_leverage = max_leverage
-        self.default_leverage = default_leverage
+        # Per-asset default leverage (used when Kelly has insufficient history)
+        ASSET_DEFAULT_LEV = {"BTC": 4.5, "ETH": 3.0, "SOL": 3.0, "LINK": 6.0}
+        self.default_leverage = ASSET_DEFAULT_LEV.get(asset_name, default_leverage)
         self.asset_name = asset_name
 
         # Per-asset Kelly fraction and max leverage
@@ -145,6 +147,7 @@ class SqueezeV13:
         self._last_exit_bar = -12
         self._entry_bar = -1
         self._trade_type = None  # "breakout" or "meanrev"
+        self._breakeven_set = False  # track if stop moved to breakeven
 
         # Rolling trade history for Kelly
         self._trade_history = []
@@ -165,6 +168,7 @@ class SqueezeV13:
         self._last_exit_bar = -12
         self._entry_bar = -1
         self._trade_type = None
+        self._breakeven_set = False
         self._trade_history = []
         self.regime_counts = {"TRENDING": 0, "SIDEWAYS": 0, "VOLATILE": 0, "TRANSITION": 0}
         self.trade_regimes = []
@@ -261,6 +265,32 @@ class SqueezeV13:
         bear_reversal = ((shootingstar > 0).astype(int) + (engulfing < 0).astype(int) +
                          (eveningstar > 0).astype(int) + (doji != 0).astype(int))
 
+        # VWAP (rolling 24h)
+        tp = (highs + lows + closes) / 3
+        vwap = (tp * volumes).rolling(24).sum() / volumes.rolling(24).sum().replace(0, 1)
+        vwap_dist = (closes - vwap) / vwap.replace(0, 1) * 100  # % distance from VWAP
+
+        # Multi-timeframe: 4h indicators from hourly data
+        close_4h = closes.rolling(4).mean()  # smoothed 4h close proxy
+        ema_4h_fast = close_4h.ewm(span=12, adjust=False).mean()  # ~48h = 2 days
+        ema_4h_slow = close_4h.ewm(span=26, adjust=False).mean()  # ~104h = 4.3 days
+        ema_4h_slope = (ema_4h_fast - ema_4h_fast.shift(4)) / ema_4h_fast.shift(4).replace(0, 1) * 100
+
+        # Daily RSI (using 24h-smoothed price changes)
+        delta_d = closes.diff(24)  # 24h change
+        gain_d = delta_d.where(delta_d > 0, 0).rolling(14 * 24).mean()
+        loss_d = (-delta_d.where(delta_d < 0, 0)).rolling(14 * 24).mean()
+        rs_d = gain_d / loss_d.replace(0, 1e-10)
+        rsi_daily = 100 - (100 / (1 + rs_d))
+
+        # 4h trend direction
+        mtf_bull = (ema_4h_fast > ema_4h_slow).astype(int)  # 1=bullish 4h trend
+
+        # Volatility clustering: ATR relative to recent ATR
+        atr_ratio = atr / atr.rolling(48).mean().replace(0, 1)  # current vs 2-day avg ATR
+        # Recent big move detection (last 4 bars had >2x normal ATR)
+        recent_vol_spike = (atr_ratio.rolling(4).max() > 1.8).astype(int)
+
         # Weak conviction candles (filter for breakout quality)
         spinningtop = pd.Series(talib.CDLSPINNINGTOP(o, h, l, c), index=data.index)
         weak_candle = ((doji != 0) | (spinningtop != 0)).astype(int)
@@ -285,6 +315,11 @@ class SqueezeV13:
             "bull_reversal": bull_reversal, "bear_reversal": bear_reversal,
             "weak_candle": weak_candle,
             "prev_high": highs.shift(1), "prev_low": lows.shift(1),
+            "vwap": vwap, "vwap_dist": vwap_dist,
+            "volume": volumes,
+            "ema_4h_slope": ema_4h_slope, "mtf_bull": mtf_bull,
+            "rsi_daily": rsi_daily,
+            "atr_ratio": atr_ratio, "recent_vol_spike": recent_vol_spike,
         }, index=data.index)
 
     def _compute_adx(self, highs, lows, closes, period=14):
@@ -374,6 +409,7 @@ class SqueezeV13:
         else:
             return 0
 
+
         if direction == "LONG" and ind["ema8"] > ind["ema21"] > ind["ema55"]:
             score += 20
         elif direction == "LONG" and ind["ema8"] > ind["ema21"]:
@@ -432,6 +468,95 @@ class SqueezeV13:
         leverage = kelly * self.kelly_fraction * 20
         min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
         return max(min_lev, min(leverage, self.max_leverage))
+
+    def _unified_confidence(self, i, direction, trade_type):
+        """Unified confidence score from all signals → leverage multiplier.
+
+        Score 50-100 maps to leverage multiplier:
+        50-60: 0.8x (marginal — reduce size)
+        60-70: 1.0x (normal)
+        70-80: 1.5x (good confluence)
+        80-90: 2.0x (strong confluence)
+        90+:   2.5x (exceptional — max conviction)
+        """
+        ind = self._ind.iloc[i]
+        score = 50  # base
+
+        # MTF: 4h trend alignment (+15)
+        ema_4h_slope = float(ind["ema_4h_slope"]) if not pd.isna(ind["ema_4h_slope"]) else 0
+        mtf_bull = int(ind["mtf_bull"]) if not pd.isna(ind["mtf_bull"]) else 0
+        if direction == "LONG" and mtf_bull == 1 and ema_4h_slope > 0.1:
+            score += 15
+        elif direction == "SHORT" and mtf_bull == 0 and ema_4h_slope < -0.1:
+            score += 15
+        elif direction == "LONG" and mtf_bull == 0 and ema_4h_slope < -0.1:
+            score -= 10  # 4h trend strongly disagrees
+        elif direction == "SHORT" and mtf_bull == 1 and ema_4h_slope > 0.1:
+            score -= 10
+
+        # VWAP agreement (+10)
+        vwap_dist = float(ind["vwap_dist"]) if not pd.isna(ind["vwap_dist"]) else 0
+        if direction == "LONG" and vwap_dist > 0.3:
+            score += 10
+        elif direction == "SHORT" and vwap_dist < -0.3:
+            score += 10
+
+        # Volume spike (+10)
+        vol_ratio = float(ind["vol_ratio"])
+        if vol_ratio > 2.5:
+            score += 10
+        elif vol_ratio > 1.8:
+            score += 5
+
+        # Volatility clustering (+8)
+        vol_spike = int(ind["recent_vol_spike"]) if not pd.isna(ind["recent_vol_spike"]) else 0
+        if vol_spike == 1:
+            score += 8
+
+        # Candlestick pattern confirmation (+7)
+        if trade_type == "meanrev":
+            if direction == "LONG" and ind["bull_reversal"] >= 1:
+                score += 7
+            elif direction == "SHORT" and ind["bear_reversal"] >= 1:
+                score += 7
+        else:  # breakout
+            if ind["body_ratio"] > 0.7:
+                score += 7
+            elif ind["body_ratio"] > 0.5:
+                score += 3
+
+        # Daily trend alignment (for breakout) (+10)
+        trend = self._daily_trend(i)
+        if trade_type == "breakout":
+            if direction == "LONG" and trend == "UP":
+                score += 10
+            elif direction == "SHORT" and trend == "DOWN":
+                score += 10
+
+        # BTC health for alts (+5)
+        if self.asset_name != "BTC" and self._btc_roc is not None:
+            try:
+                ts = self._ind.index[i]
+                idx = self._btc_roc.index.get_indexer([ts], method="nearest")[0]
+                btc_roc = float(self._btc_roc.iloc[idx])
+                if direction == "LONG" and btc_roc > 2:
+                    score += 5
+                elif direction == "SHORT" and btc_roc < -2:
+                    score += 5
+            except Exception:
+                pass
+
+        score = max(40, min(score, 100))
+
+        # Map score to leverage multiplier (only used for BTC)
+        if score >= 80:
+            return 1.5
+        elif score >= 70:
+            return 1.3
+        elif score >= 60:
+            return 1.1
+        else:
+            return 1.0
 
     def _regime_leverage_mult(self, regime, trend, direction):
         if regime == "VOLATILE":
@@ -502,14 +627,16 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("LONG")
             regime_mult = self._regime_leverage_mult(regime, trend, "LONG")
+            conf_mult = self._unified_confidence(i, "LONG", "breakout") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
-            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
             bo_stop_mult = ASSET_BO_STOP.get(self.asset_name, 2.5)
             bo_target_mult = ASSET_BO_TARGET.get(self.asset_name, 12)
             self._trailing_stop = price - (atr * bo_stop_mult)
             self._best_price = price
             self._entry_bar = i
+            self._breakeven_set = False
             self._trade_type = "breakout"
 
             return {
@@ -544,14 +671,16 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("SHORT")
             regime_mult = self._regime_leverage_mult(regime, trend, "SHORT")
+            conf_mult = self._unified_confidence(i, "SHORT", "breakout") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
-            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
             bo_stop_mult = ASSET_BO_STOP.get(self.asset_name, 2.5)
             bo_target_mult = ASSET_BO_TARGET.get(self.asset_name, 12)
             self._trailing_stop = price + (atr * bo_stop_mult)
             self._best_price = price
             self._entry_bar = i
+            self._breakeven_set = False
             self._trade_type = "breakout"
 
             return {
@@ -583,6 +712,8 @@ class SqueezeV13:
 
         trend = self._daily_trend(i)
 
+        vwap_dist = float(ind["vwap_dist"]) if not pd.isna(ind["vwap_dist"]) else 0
+
         # LONG: price near lower BB + RSI oversold + Williams %R oversold + bullish candle
         if (price <= bb_lower * (1 + self.mr_bb_entry_pct) and
             rsi < self.mr_rsi_long and
@@ -604,12 +735,14 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("LONG")
             regime_mult = self._regime_leverage_mult(regime, trend, "LONG")
+            conf_mult = self._unified_confidence(i, "LONG", "meanrev") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
-            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
             self._trailing_stop = stop
             self._best_price = price
             self._entry_bar = i
+            self._breakeven_set = False
             self._trade_type = "meanrev"
 
             return {
@@ -641,17 +774,209 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("SHORT")
             regime_mult = self._regime_leverage_mult(regime, trend, "SHORT")
+            conf_mult = self._unified_confidence(i, "SHORT", "meanrev") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
+
+            self._trailing_stop = stop
+            self._best_price = price
+            self._entry_bar = i
+            self._breakeven_set = False
+            self._trade_type = "meanrev"
+
+            return {
+                "action": "SHORT",
+                "signal": f"V13_MR_S(rsi{rsi:.0f},w{willr:.0f},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
+                "stop": stop,
+                "target": target,
+                "leverage": lev,
+            }
+
+        return None
+
+    # Per-asset VWAP bounce enable
+    VWAP_BOUNCE_ASSETS = {"ETH", "LINK"}  # BTC/SOL excluded — loses money
+
+    def _try_vwap_bounce(self, data, i, regime):
+        """VWAP bounce: price pulls back to VWAP in a trend and bounces."""
+        if self.asset_name not in self.VWAP_BOUNCE_ASSETS:
+            return None
+        ind = self._ind.iloc[i]
+        price = float(ind["close"])
+        atr = float(ind["atr"])
+        vwap = float(ind["vwap"]) if not pd.isna(ind["vwap"]) else 0
+        vwap_dist = float(ind["vwap_dist"]) if not pd.isna(ind["vwap_dist"]) else 0
+        rsi = float(ind["rsi"])
+
+        if vwap <= 0 or pd.isna(atr) or atr <= 0:
+            return None
+
+        trend = self._daily_trend(i)
+        ema_4h_slope = float(ind["ema_4h_slope"]) if not pd.isna(ind["ema_4h_slope"]) else 0
+        mtf_bull = int(ind["mtf_bull"]) if not pd.isna(ind["mtf_bull"]) else 0
+
+        # LONG: uptrend, price pulls back close to VWAP, then bullish candle bounces
+        if (trend == "UP" and
+            mtf_bull == 1 and
+            ema_4h_slope > 0.05 and
+            -0.3 <= vwap_dist <= 0.3 and  # price near VWAP
+            40 <= rsi <= 55 and  # pulled back but not oversold
+            ind["bullish"] == 1 and
+            ind["body_ratio"] > 0.4 and
+            ind["vol_ratio"] > 0.8):
+
+            if not self._direction_allowed("LONG", i, regime):
+                return None
+            if self._btc_crashed(data.index[i]):
+                return None
+
+            stop = price - (atr * 1.5)
+            target = price + (atr * 4.0)
+
+            kelly_lev = self._compute_kelly("LONG")
+            regime_mult = self._regime_leverage_mult(regime, trend, "LONG")
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
 
             self._trailing_stop = stop
             self._best_price = price
             self._entry_bar = i
+            self._breakeven_set = False
+            self._trade_type = "breakout"  # use breakout exit logic (trailing)
+
+            return {
+                "action": "LONG",
+                "signal": f"V13_VB_L(vd{vwap_dist:.1f},r{regime[0]},l{lev:.1f}x)",
+                "stop": stop,
+                "target": target,
+                "leverage": lev,
+            }
+
+        # SHORT: downtrend, price retraces up to VWAP, then bearish candle
+        if (trend == "DOWN" and
+            mtf_bull == 0 and
+            ema_4h_slope < -0.05 and
+            -0.3 <= vwap_dist <= 0.3 and
+            45 <= rsi <= 60 and
+            ind["bullish"] == 0 and
+            ind["body_ratio"] > 0.4 and
+            ind["vol_ratio"] > 0.8):
+
+            if not self._direction_allowed("SHORT", i, regime):
+                return None
+
+            stop = price + (atr * 1.5)
+            target = price - (atr * 4.0)
+
+            kelly_lev = self._compute_kelly("SHORT")
+            regime_mult = self._regime_leverage_mult(regime, trend, "SHORT")
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
+
+            self._trailing_stop = stop
+            self._best_price = price
+            self._entry_bar = i
+            self._breakeven_set = False
+            self._trade_type = "breakout"
+
+            return {
+                "action": "SHORT",
+                "signal": f"V13_VB_S(vd{vwap_dist:.1f},r{regime[0]},l{lev:.1f}x)",
+                "stop": stop,
+                "target": target,
+                "leverage": lev,
+            }
+
+        return None
+
+    def _try_overextension_mr(self, data, i, regime):
+        """High-conviction MR when RSI is extremely overextended. Works in ALL regimes."""
+        ind = self._ind.iloc[i]
+        price = float(ind["close"])
+        atr = float(ind["atr"])
+        rsi = float(ind["rsi"])
+        bb_lower = float(ind["bb_lower"])
+        bb_upper = float(ind["bb_upper"])
+        bb_mid = float(ind["bb_mid"])
+
+        if pd.isna(bb_mid) or pd.isna(atr) or atr <= 0:
+            return None
+
+        trend = self._daily_trend(i)
+
+        willr = float(ind["willr"]) if not pd.isna(ind["willr"]) else -50
+
+        # LONG: RSI extremely oversold — violent reversal expected
+        if (rsi < 15 and
+            willr < -90 and
+            price < bb_lower and
+            ind["bullish"] == 1 and
+            ind["body_ratio"] > 0.4):
+
+            if not self._direction_allowed("LONG", i, regime):
+                return None
+
+            stop = price - (atr * 1.5)
+            target = bb_mid + (bb_upper - bb_mid) * 0.5
+
+            gain_dist = target - price
+            loss_dist = price - stop
+            if loss_dist <= 0 or gain_dist / loss_dist < 1.0:
+                return None
+
+            kelly_lev = self._compute_kelly("LONG")
+            regime_mult = 2.0  # high conviction override
+            conf_mult = self._unified_confidence(i, "LONG", "meanrev") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
+
+            self._trailing_stop = stop
+            self._best_price = price
+            self._entry_bar = i
+            self._breakeven_set = False
+            self._trade_type = "meanrev"
+
+            return {
+                "action": "LONG",
+                "signal": f"V13_OX_L(rsi{rsi:.0f},r{regime[0]},l{lev:.1f}x)",
+                "stop": stop,
+                "target": target,
+                "leverage": lev,
+            }
+
+        # SHORT: RSI extremely overbought — violent reversal expected
+        if (rsi > 85 and
+            willr > -10 and
+            price > bb_upper and
+            ind["bullish"] == 0 and
+            ind["body_ratio"] > 0.4):
+
+            if not self._direction_allowed("SHORT", i, regime):
+                return None
+
+            stop = price + (atr * 1.5)
+            target = bb_mid - (bb_mid - bb_lower) * 0.5
+
+            gain_dist = price - target
+            loss_dist = stop - price
+            if loss_dist <= 0 or gain_dist / loss_dist < 1.0:
+                return None
+
+            kelly_lev = self._compute_kelly("SHORT")
+            regime_mult = 2.0
+            conf_mult = self._unified_confidence(i, "SHORT", "meanrev") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
+
+            self._trailing_stop = stop
+            self._best_price = price
+            self._entry_bar = i
+            self._breakeven_set = False
             self._trade_type = "meanrev"
 
             return {
                 "action": "SHORT",
-                "signal": f"V13_MR_S(rsi{rsi:.0f},w{willr:.0f},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
+                "signal": f"V13_OX_S(rsi{rsi:.0f},r{regime[0]},l{lev:.1f}x)",
                 "stop": stop,
                 "target": target,
                 "leverage": lev,
@@ -676,6 +1001,13 @@ class SqueezeV13:
 
         regime = self._detect_regime(i)
 
+        # Overextension MR works in ALL regimes — check first
+        ox_signal = self._try_overextension_mr(data, i, regime)
+        if ox_signal:
+            self.regime_counts[regime] += 1
+            self.trade_regimes.append((regime, ox_signal["action"], "overext_mr"))
+            return ox_signal
+
         if regime == "TRENDING":
             self.regime_counts["TRENDING"] += 1
             return None
@@ -690,7 +1022,15 @@ class SqueezeV13:
             if signal:
                 self.regime_counts["SIDEWAYS"] += 1
                 self.trade_regimes.append((regime, signal["action"], "breakout"))
-            return signal
+                return signal
+            # VWAP bounce in SIDEWAYS (LINK only)
+            if self.asset_name == "LINK":
+                signal = self._try_vwap_bounce(data, i, regime)
+                if signal:
+                    self.regime_counts["SIDEWAYS"] += 1
+                    self.trade_regimes.append((regime, signal["action"], "vwap_bounce"))
+                    return signal
+            return None
 
         elif regime == "VOLATILE":
             self.regime_counts["VOLATILE"] += 1
@@ -705,6 +1045,12 @@ class SqueezeV13:
                         return None
                 self.regime_counts["TRANSITION"] += 1
                 self.trade_regimes.append((regime, signal["action"], "breakout"))
+                return signal
+            # VWAP bounce in TRANSITION
+            signal = self._try_vwap_bounce(data, i, regime)
+            if signal:
+                self.regime_counts["TRANSITION"] += 1
+                self.trade_regimes.append((regime, signal["action"], "vwap_bounce"))
                 return signal
             return None
 
@@ -758,6 +1104,25 @@ class SqueezeV13:
         return None
 
     def _check_exit_breakout(self, i, price, atr, trade):
+        # Breakeven stop: after 2 ATR in profit, move stop to entry + 0.5 ATR
+        if not self._breakeven_set:
+            if trade.direction == "LONG":
+                pnl_atr = (price - trade.entry_price) / atr
+                if pnl_atr >= 2.0:
+                    be_stop = trade.entry_price + atr * 0.5
+                    if be_stop > (self._trailing_stop or 0):
+                        self._trailing_stop = be_stop
+                        trade.stop_price = be_stop
+                    self._breakeven_set = True
+            elif trade.direction == "SHORT":
+                pnl_atr = (trade.entry_price - price) / atr
+                if pnl_atr >= 2.0:
+                    be_stop = trade.entry_price - atr * 0.5
+                    if be_stop < (self._trailing_stop or float('inf')):
+                        self._trailing_stop = be_stop
+                        trade.stop_price = be_stop
+                    self._breakeven_set = True
+
         # Improved time exit: only exit unprofitable trades after 12 bars (was 10)
         if i - self._entry_bar >= 12:
             if trade.direction == "LONG":

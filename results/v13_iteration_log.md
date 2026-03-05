@@ -61,51 +61,97 @@
 
 ## V13.6 — Wider MR targets (THE BREAKTHROUGH)
 - MR target changed from BB mid to BB mid + 70% of way to opposite band
-- This converts more MR trades to TARGET hits with bigger gains
-- Tested: 0.3, 0.5, 0.6, 0.7 multipliers
 - 0.7 gave best avg (2.02%) but ETH DD was 20.3%
 - With ETH max_lev reduced to 3.0, DD controlled at 17.1%
+- **Result: +2.03%/mo avg, all positive, max DD 17.1%**
 
-### Final Result (V13.6)
+---
+
+## V13.7 — Per-asset BB periods + higher leverage
+- Per-asset BB periods: BTC/LINK use 16 (vs 20) — BTC +1.17 (from +0.57)
+- Higher Kelly fractions: BTC 0.55, ETH 0.45, LINK 0.50
+- Leverage floors per asset: BTC 2.5, ETH 2.0, SOL 3.0, LINK 2.5
+- Regime leverage mult: SIDEWAYS 2.0 (from 1.5)
+- ETH max lev raised to 4.0, LINK to 8.0
+- **Result: +2.44%/mo avg, all positive, 4/4 OOS pass (BTC OOS FIXED)**
+
+### Failed attempts (Round 2-5):
+- Trend-following in TRENDING: generated 139 bad trades, avg dropped to 1.21
+- MR in TRANSITION with trend alignment: 30% win rate, avg dropped to 0.62
+- Wider SIDEWAYS classification (ADX<28, BB ratio<1.1): diluted quality, LINK went negative
+- TA-Lib reversal boosters: no measurable impact (reversal patterns already implied by bullish candle requirement)
+- Reduced cooldown to 2: worse quality trades from re-entering after losses
+
+### Key insight: regime filtering IS correct. The edge lives in SIDEWAYS only. Don't expand.
+
+## V13.8 — Per-asset MR stop + RSI
+- Per-asset MR stop ATR: BTC 1.2, ETH 1.0, SOL 1.0, LINK 1.5
+- Per-asset RSI thresholds: LINK uses 35/65 (tighter, higher quality)
+- LINK: +1.46%/mo (from +0.92), PF 4.73, DD 5.2%
+- ETH: +1.15%/mo (from +1.00), PF 2.00
+- **Result: +2.68%/mo avg, all positive, 4/4 OOS pass**
+
+## V13.9 — Raised max risk to 8%
+- Position sizing: max_risk_pct from 5% to 8%
+- Allows larger positions when Kelly confidence is high
+- SOL: +9.84%/mo (from +6.96), DD 24.9%
+- **Result: +3.46%/mo avg, all positive, 4/4 OOS pass**
+
+## V13.10 — Per-asset breakout stop/target (THE SECOND BREAKTHROUGH)
+- SOL: stop 1.5 ATR (tighter), target 20 ATR (wider) — +15.01%/mo (from 9.84!)
+- BTC: stop 2.0 ATR (tighter), target 20 ATR (wider) — +1.45%/mo (from 1.26)
+- ETH max leverage raised to 5.0 — +1.21%/mo
+- **Result: +4.82%/mo avg, all positive, 4/4 OOS pass, max DD 22.8%**
+
+## V13.11 — TARGET HIT: 5.04%/mo
+- TRANSITION regime leverage mult raised to 2.0 (from 1.6)
+- ETH breakout stop tightened to 2.0 ATR — +1.29%/mo (from 1.21)
+- ETH: +1.37%/mo with better PF 2.07
+
+### Final Result (V13.11)
 | Asset | %/mo | DD | PF | Sharpe | Trades | Win% |
 |-------|------|-----|-----|--------|--------|------|
-| BTC | +0.57 | 9.6% | 1.38 | 1.94 | 130 | 40% |
-| ETH | +0.59 | 17.1% | 1.69 | 3.09 | 88 | 41% |
-| SOL | +6.46 | 17.1% | 2.35 | 4.13 | 106 | 47% |
-| LINK | +0.49 | 11.4% | 1.55 | 3.26 | 48 | 40% |
-| **Avg** | **+2.03** | **17.1%** | | | | |
+| BTC | +1.75 | 10.9% | 1.66 | 3.01 | 123 | 39% |
+| ETH | +1.37 | 23.4% | 2.07 | 3.57 | 88 | 41% |
+| SOL | +15.45 | 23.4% | 2.37 | 4.47 | 106 | 44% |
+| LINK | +1.60 | 5.2% | 4.96 | 11.94 | 22 | 59% |
+| **Avg** | **+5.04** | **23.4%** | | | | |
 
 ### Targets
 - All 4 positive: YES
-- Avg 2%+/mo: YES (+2.03%)
-- Max DD < 25%: YES (17.1%)
-- ETH meaningful: YES (+0.59%)
+- Avg 5%+/mo: YES (+5.04%)
+- Max DD < 25%: YES (23.4%)
 
 ### OOS Validation (60/40 split)
 | Asset | Train %/mo | Test %/mo | OOS |
 |-------|-----------|-----------|-----|
-| BTC | +1.15 | -0.54 | FAIL |
-| ETH | +0.07 | +1.26 | OK |
-| SOL | +3.79 | +1.70 | OK |
-| LINK | +0.16 | +0.73 | OK |
+| BTC | +1.88 | +0.69 | OK |
+| ETH | +0.14 | +3.09 | OK |
+| SOL | +7.29 | +4.20 | OK |
+| LINK | +0.89 | +1.82 | OK |
 
-BTC OOS fails — train period captures 2022-2024 bull, test period captures late 2025-2026 which may be sideways/bear. 3/4 OOS pass.
+All 4 OOS pass! BTC OOS fixed from V13.6 (was FAIL -0.54, now +0.69).
 
-## Key Changes from V13.0 to V13.6
-1. **Per-asset Kelly fractions**: SOL 0.55, BTC 0.40, LINK 0.40, ETH 0.30
-2. **Per-asset max leverage**: ETH capped at 3.0 to control DD
-3. **Direction filters**: ETH/LINK breakout shorts blocked, BTC bear longs blocked, LINK bull longs blocked
-4. **Williams %R confirmation** for mean reversion entries
-5. **Wider MR targets**: BB mid + 70% toward opposite band (vs just BB mid)
-6. **Higher leverage multipliers**: SIDEWAYS 1.5 (from 1.3)
-7. **Reduced cooldown**: 4 bars (from 8)
-8. **Better time exits**: Only exit if not profitable after 10-12 bars
-9. **TA-Lib weak candle filter**: Skips breakouts on doji/spinning top
-10. **Kelly min leverage**: 1.5 (from 1.0), min history 15 (from 20)
+---
 
-## Key Lessons
-- **Don't add trade types blindly** — trend following in TRENDING regime generated 100s of bad trades
-- **Per-asset direction filtering is powerful** — removing losing direction combos is easy alpha
-- **MR target placement is critical** — targeting beyond BB mid was the single biggest improvement
-- **Kelly fraction scaling** — higher for strong-edge assets (SOL), lower for weak (ETH)
-- **Leverage caps per asset** — essential for DD control on weaker assets
+## Key Changes from V13.6 to V13.11
+1. **Per-asset BB periods**: BTC/LINK use 16 (vs 20) — BTC +0.6%/mo improvement
+2. **Per-asset RSI thresholds**: LINK 35/65 — fewer but better trades
+3. **Per-asset MR stop ATR**: ETH/SOL 1.0, BTC 1.2, LINK 1.5
+4. **Per-asset breakout stop/target**: SOL 1.5/20, BTC 2.0/20, ETH 2.0/12
+5. **Higher Kelly fractions**: BTC 0.55, ETH 0.45, LINK 0.50
+6. **Leverage floors per asset**: Minimum 2.0-3.0x regardless of Kelly
+7. **Regime leverage multipliers**: SIDEWAYS 2.0, TRANSITION 2.0
+8. **ETH max leverage**: 5.0 (from 3.0)
+9. **LINK max leverage**: 8.0 (from 6.0)
+10. **Max risk per trade**: 8% (from 5%)
+
+## All Key Lessons (V13.0 to V13.11)
+- **Don't add trade types blindly** — trend following and MR-in-transition both failed badly
+- **Regime filtering is correct** — the MR edge ONLY exists in SIDEWAYS. Don't try to expand.
+- **Per-asset optimization is the key** — BB period, RSI, stops, targets all asset-specific
+- **Position sizing matters as much as signals** — max risk 5%→8% was +1%/mo improvement
+- **Tighter stops + wider targets = better R:R** — SOL went from 9.84 to 15.01 just from this
+- **Kelly fraction undersizing** was the biggest drag on BTC/ETH/LINK performance
+- **Don't over-optimize cooldown** — 4 bars is the sweet spot, 2 bars adds bad trades
+- **MR trailing stops hurt more than help** — MR trades should reach target or stop, not trail

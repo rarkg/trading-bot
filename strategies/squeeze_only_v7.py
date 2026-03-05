@@ -70,16 +70,37 @@ class SqueezeOnlyV7:
         
         ema21_slope = (ema21 - ema21.shift(5)) / ema21.shift(5).replace(0, 1) * 100
         d_slope = (ema_d_fast - ema_d_fast.shift(24)) / ema_d_fast.shift(24).replace(0, 1) * 100
-        
+
+        # ATR as percentage of price
+        atr_pct = atr / closes * 100
+
+        # Range position (50-bar high/low)
+        range_high = highs.rolling(50).max()
+        range_low = lows.rolling(50).min()
+        range_pct = (closes - range_low) / (range_high - range_low).replace(0, 1)
+
+        # ADX from +DI / -DI with 14-period smoothing
+        plus_dm = highs.diff()
+        minus_dm = -lows.diff()
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+
+        atr14 = tr.rolling(14).sum()
+        plus_di = 100 * plus_dm.rolling(14).sum() / atr14.replace(0, 1)
+        minus_di = 100 * minus_dm.rolling(14).sum() / atr14.replace(0, 1)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1)
+        adx = dx.rolling(14).mean()
+
         self._ind = pd.DataFrame({
             "close": closes, "high": highs, "low": lows,
             "ema8": ema8, "ema21": ema21, "ema55": ema55,
             "ema_d_fast": ema_d_fast, "ema_d_slow": ema_d_slow, "ema_d_trend": ema_d_trend,
-            "atr": atr, "rsi": rsi, "vol_ratio": vol_ratio,
+            "atr": atr, "atr_pct": atr_pct, "rsi": rsi, "vol_ratio": vol_ratio,
             "bb_width": bb_width, "is_squeeze": is_squeeze,
             "body_ratio": body_ratio, "bullish": bullish,
             "ema21_slope": ema21_slope, "d_slope": d_slope,
             "prev_high": highs.shift(1), "prev_low": lows.shift(1),
+            "range_pct": range_pct, "adx": adx,
         })
     
     def _daily_trend(self, i):
@@ -90,6 +111,17 @@ class SqueezeOnlyV7:
             return "DOWN"
         return "FLAT"
     
+    def _market_regime(self, i):
+        ind = self._ind.iloc[i]
+        adx_val = ind["adx"]
+        has_adx = not pd.isna(adx_val)
+        if has_adx and adx_val > 25:
+            if ind["close"] > ind["ema_d_trend"]:
+                return "bull"
+            else:
+                return "bear"
+        return "sideways"
+
     def _confidence(self, i, direction):
         ind = self._ind.iloc[i]
         score = 0
@@ -188,6 +220,16 @@ class SqueezeOnlyV7:
                 "stop": price - (atr * 2.5),
                 "target": price + (atr * 10),  # Wide target
                 "leverage": lev,
+                "confidence_score": score,
+                "rsi_at_entry": float(ind["rsi"]),
+                "atr_at_entry": float(ind["atr"]),
+                "atr_pct_at_entry": float(ind["atr"]) / price * 100,
+                "vol_ratio_at_entry": float(ind["vol_ratio"]),
+                "bb_width_at_entry": float(ind["bb_width"]),
+                "ema_trend_at_entry": self._daily_trend(i),
+                "range_position_at_entry": float(ind["range_pct"]) if not pd.isna(ind["range_pct"]) else None,
+                "adx_at_entry": float(ind["adx"]) if not pd.isna(ind["adx"]) else None,
+                "market_regime": self._market_regime(i),
             }
         
         # SHORT: squeeze + break below prev low + bearish candle + volume
@@ -214,6 +256,16 @@ class SqueezeOnlyV7:
                 "stop": price + (atr * 2.5),
                 "target": price - (atr * 10),
                 "leverage": lev,
+                "confidence_score": score,
+                "rsi_at_entry": float(ind["rsi"]),
+                "atr_at_entry": float(ind["atr"]),
+                "atr_pct_at_entry": float(ind["atr"]) / price * 100,
+                "vol_ratio_at_entry": float(ind["vol_ratio"]),
+                "bb_width_at_entry": float(ind["bb_width"]),
+                "ema_trend_at_entry": self._daily_trend(i),
+                "range_position_at_entry": float(ind["range_pct"]) if not pd.isna(ind["range_pct"]) else None,
+                "adx_at_entry": float(ind["adx"]) if not pd.isna(ind["adx"]) else None,
+                "market_regime": self._market_regime(i),
             }
         
         return None

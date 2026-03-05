@@ -71,6 +71,17 @@ class SqueezeV12:
         atr = tr.rolling(14).mean()
         atr_pct = atr / closes * 100
 
+        # ADX
+        plus_dm = highs.diff()
+        minus_dm = -lows.diff()
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+        atr14_sum = tr.rolling(14).sum()
+        plus_di = 100 * plus_dm.rolling(14).sum() / atr14_sum.replace(0, 1)
+        minus_di = 100 * minus_dm.rolling(14).sum() / atr14_sum.replace(0, 1)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1)
+        adx = dx.rolling(14).mean()
+
         # RSI
         delta = closes.diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
@@ -114,6 +125,7 @@ class SqueezeV12:
             "range_pct": range_pct,
             "body_ratio": body_ratio, "bullish": bullish_int,
             "d_slope": d_slope,
+            "adx": adx,
             "bear_market": bear_market,
             "prev_high": highs.shift(1), "prev_low": lows.shift(1),
         }, index=data.index)
@@ -125,6 +137,17 @@ class SqueezeV12:
         elif ind["ema_d_fast"] < ind["ema_d_slow"] < ind["ema_d_trend"]:
             return "DOWN"
         return "FLAT"
+
+    def _market_regime(self, i):
+        ind = self._ind.iloc[i]
+        close = float(ind["close"])
+        ema_200d = float(ind["ema_200d"])
+        adx_val = float(ind["adx"]) if not pd.isna(ind["adx"]) else 0
+        if close > ema_200d and adx_val > 25:
+            return "bull"
+        elif close < ema_200d and adx_val > 25:
+            return "bear"
+        return "sideways"
 
     def _confidence(self, i, direction):
         ind = self._ind.iloc[i]
@@ -247,6 +270,16 @@ class SqueezeV12:
                 "stop": price - (atr * 2.5),
                 "target": price + (atr * 12),
                 "leverage": lev,
+                "confidence_score": score,
+                "rsi_at_entry": rsi,
+                "atr_at_entry": atr,
+                "atr_pct_at_entry": atr_pct,
+                "vol_ratio_at_entry": vol_ratio,
+                "bb_width_at_entry": float(ind["bb_width"]),
+                "ema_trend_at_entry": self._daily_trend(i),
+                "range_position_at_entry": range_pct,
+                "adx_at_entry": float(ind["adx"]) if not pd.isna(ind["adx"]) else None,
+                "market_regime": self._market_regime(i),
             }
 
         # SHORT signal
@@ -285,6 +318,16 @@ class SqueezeV12:
                 "stop": price + (atr * 2.5),
                 "target": price - (atr * 12),
                 "leverage": lev,
+                "confidence_score": score,
+                "rsi_at_entry": rsi,
+                "atr_at_entry": atr,
+                "atr_pct_at_entry": atr_pct,
+                "vol_ratio_at_entry": vol_ratio,
+                "bb_width_at_entry": float(ind["bb_width"]),
+                "ema_trend_at_entry": self._daily_trend(i),
+                "range_position_at_entry": range_pct,
+                "adx_at_entry": float(ind["adx"]) if not pd.isna(ind["adx"]) else None,
+                "market_regime": self._market_regime(i),
             }
 
         return None

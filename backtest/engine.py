@@ -25,11 +25,23 @@ class Trade:
     stop_price: float = 0
     target_price: float = 0
     size_usd: float = 0
+    confidence_score: int = 0
+    leverage: float = 1.0
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
     pnl_pct: float = 0
     pnl_usd: float = 0
+    # Indicator snapshots at entry
+    rsi_at_entry: Optional[float] = None
+    atr_at_entry: Optional[float] = None
+    atr_pct_at_entry: Optional[float] = None
+    vol_ratio_at_entry: Optional[float] = None
+    bb_width_at_entry: Optional[float] = None
+    ema_trend_at_entry: Optional[str] = None
+    range_position_at_entry: Optional[float] = None
+    adx_at_entry: Optional[float] = None
+    market_regime: Optional[str] = None
 
 
 @dataclass
@@ -181,6 +193,17 @@ class BacktestEngine:
                         stop_price=stop,
                         target_price=target,
                         size_usd=round(size, 2),
+                        confidence_score=signal.get("confidence_score", 0),
+                        leverage=sig_leverage,
+                        rsi_at_entry=signal.get("rsi_at_entry"),
+                        atr_at_entry=signal.get("atr_at_entry"),
+                        atr_pct_at_entry=signal.get("atr_pct_at_entry"),
+                        vol_ratio_at_entry=signal.get("vol_ratio_at_entry"),
+                        bb_width_at_entry=signal.get("bb_width_at_entry"),
+                        ema_trend_at_entry=signal.get("ema_trend_at_entry"),
+                        range_position_at_entry=signal.get("range_position_at_entry"),
+                        adx_at_entry=signal.get("adx_at_entry"),
+                        market_regime=signal.get("market_regime"),
                     )
             
             # Track equity

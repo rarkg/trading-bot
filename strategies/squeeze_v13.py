@@ -33,6 +33,21 @@ ASSET_KELLY = {
     "LINK": 0.50,
 }
 
+# Per-asset breakout stop/target ATR multipliers
+ASSET_BO_STOP = {
+    "BTC": 2.0,
+    "ETH": 2.5,
+    "SOL": 1.5,
+    "LINK": 2.5,
+}
+
+ASSET_BO_TARGET = {
+    "BTC": 20,
+    "ETH": 12,
+    "SOL": 20,
+    "LINK": 12,
+}
+
 # Per-asset MR stop ATR multiplier
 ASSET_MR_STOP = {
     "BTC": 1.2,
@@ -68,7 +83,7 @@ ASSET_MIN_LEVERAGE = {
 # Per-asset max leverage to control drawdown
 ASSET_MAX_LEVERAGE = {
     "BTC": 8.0,
-    "ETH": 4.0,  # raised from 3.0 — was capping 89% of trades
+    "ETH": 5.0,  # raised from 4.0
     "SOL": 8.0,
     "LINK": 8.0,  # raised from 6.0 — was capping 58% of trades
 }
@@ -490,7 +505,9 @@ class SqueezeV13:
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
 
-            self._trailing_stop = price - (atr * 2.5)
+            bo_stop_mult = ASSET_BO_STOP.get(self.asset_name, 2.5)
+            bo_target_mult = ASSET_BO_TARGET.get(self.asset_name, 12)
+            self._trailing_stop = price - (atr * bo_stop_mult)
             self._best_price = price
             self._entry_bar = i
             self._trade_type = "breakout"
@@ -498,8 +515,8 @@ class SqueezeV13:
             return {
                 "action": "LONG",
                 "signal": f"V13_BO_L(s{score},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
-                "stop": price - (atr * 2.5),
-                "target": price + (atr * 12),
+                "stop": price - (atr * bo_stop_mult),
+                "target": price + (atr * bo_target_mult),
                 "leverage": lev,
             }
 
@@ -530,7 +547,9 @@ class SqueezeV13:
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult, self.max_leverage)), 2)
 
-            self._trailing_stop = price + (atr * 2.5)
+            bo_stop_mult = ASSET_BO_STOP.get(self.asset_name, 2.5)
+            bo_target_mult = ASSET_BO_TARGET.get(self.asset_name, 12)
+            self._trailing_stop = price + (atr * bo_stop_mult)
             self._best_price = price
             self._entry_bar = i
             self._trade_type = "breakout"
@@ -538,8 +557,8 @@ class SqueezeV13:
             return {
                 "action": "SHORT",
                 "signal": f"V13_BO_S(s{score},k{kelly_lev:.1f},r{regime[0]},l{lev:.1f}x)",
-                "stop": price + (atr * 2.5),
-                "target": price - (atr * 12),
+                "stop": price + (atr * bo_stop_mult),
+                "target": price - (atr * bo_target_mult),
                 "leverage": lev,
             }
 

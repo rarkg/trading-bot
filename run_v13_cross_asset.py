@@ -88,7 +88,27 @@ class V13Engine(BacktestEngine):
 
                 if not exit_reason:
                     sig = strategy.check_exit(data, i, open_trade)
-                    if sig:
+                    if isinstance(sig, str) and sig.startswith("PYRAMID_"):
+                        # Add to position: increase size_usd
+                        pct = int(sig.split("_")[1]) / 100.0
+                        add_size = open_trade.size_usd * pct
+                        # Cap pyramid: don't risk more than max_risk of current capital
+                        max_add = capital * self.max_risk_pct * 2
+                        add_size = min(add_size, max_add)
+                        open_trade.size_usd = round(open_trade.size_usd + add_size, 2)
+                        # Move stop to breakeven + 0.5 ATR
+                        atr_now = float(data.iloc[i]["high"] - data.iloc[i]["low"])
+                        if open_trade.direction == "LONG":
+                            be_stop = open_trade.entry_price + atr_now * 0.5
+                            if be_stop > open_trade.stop_price:
+                                open_trade.stop_price = be_stop
+                                strategy._trailing_stop = be_stop
+                        else:
+                            be_stop = open_trade.entry_price - atr_now * 0.5
+                            if be_stop < open_trade.stop_price:
+                                open_trade.stop_price = be_stop
+                                strategy._trailing_stop = be_stop
+                    elif sig:
                         exit_reason = sig
                         exit_price = price
 
@@ -246,9 +266,13 @@ def main():
     v13_kelly = {}
     v13_strats = {}
 
+    # Per-asset max risk: BTC/LINK push harder (PF > 1.5, DD headroom)
+    ASSET_MAX_RISK = {"BTC": 11.0, "ETH": 8.0, "SOL": 8.0, "LINK": 10.0}
+
     for sym in ASSETS:
         data = datasets[sym]
-        engine = V13Engine(initial_capital=1000, fee_pct=0.045, max_risk_pct=8.0)
+        max_risk = ASSET_MAX_RISK.get(sym, 8.0)
+        engine = V13Engine(initial_capital=1000, fee_pct=0.045, max_risk_pct=max_risk)
         strat = SqueezeV13(btc_data=btc_data, asset_name=sym)
         if sym != "BTC":
             strat.set_btc_data(btc_data)

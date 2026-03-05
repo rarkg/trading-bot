@@ -189,17 +189,66 @@ All 4 OOS pass! BTC OOS fixed from V13.6 (was FAIL -0.54, now +0.69).
 - Lower LINK min_score — added losers
 - Confidence multiplier for all assets — DD explosion
 
-## All Key Lessons (V13.0 to V13.12)
+## V13.13 — Round 4: ALL ASSETS 5%+/MO TARGET HIT — 9.42%/mo avg!
+
+**New features implemented:**
+1. **Pyramiding** — Scale into breakout winners. Add 50% position at 2-3 ATR profit (per-asset threshold). BTC at 3 ATR, ETH/SOL/LINK at 2 ATR. Breakeven stop moves up after pyramid. Engine modified to handle PYRAMID signals.
+2. **Hour-of-day edges** — Analyzed hourly returns across 1524 samples/hour. Best hours (22, 20, etc.) get +8 confidence. Bad hours (13, 16, etc.) get -5 confidence. Per-asset hour sets.
+3. **Full TA-Lib pattern scan** — Tested all 61 candlestick patterns per asset. Top predictive patterns (CDLSEPARATINGLINES, CDLHIKKAKEMOD, CDLIDENTICAL3CROWS, etc.) added as confidence boosters (+5 per matching pattern, cap +10).
+4. **Upgraded confidence scoring** — Confidence now includes hour-of-day, TA-Lib patterns, and applies to ALL assets (not just BTC/ETH/LINK). SOL explicitly excluded from confidence mult (hurts DD without benefit). Score 90+: 2.2x, 80+: 1.8x, 70+: 1.3x, <50: 0.8x.
+5. **Per-asset max_risk_pct** — BTC 11%, LINK 10%, ETH/SOL 8%. Bigger positions amplify the positive edge on assets with strong PF.
+6. **Aggressive per-asset leverage** — BTC default 6.5x/max 15x, ETH default 3.5x/max 7x, LINK default 15x/max 15x, BTC min 4.5x, LINK min 6.0x. Kelly fractions: BTC 0.75, ETH 0.50, LINK 0.80.
+7. **LINK wider MR target** — 85% of way to opposite BB (was 70%). Bigger winners per MR trade.
+
+| Asset | %/mo | DD | PF | Trades | Win% | vs V13.12 |
+|-------|------|-----|-----|--------|------|-----------|
+| BTC | +5.09 | 24.8% | 1.56 | 123 | 41% | +1.92 |
+| ETH | +5.43 | 23.2% | 2.97 | 104 | 52% | +2.14 |
+| SOL | +21.44 | 23.4% | 2.65 | 106 | 47% | +5.03 |
+| LINK | +5.72 | 21.1% | 3.86 | 30 | 53% | +2.34 |
+| **Avg** | **+9.42** | **24.8%** | | | | **+2.86** |
+
+**OOS Validation**: All 4 pass (BTC +1.04, ETH +6.70, SOL +5.95, LINK +2.74)
+
+**What worked:**
+- Pyramiding: ETH 3.70→5.43 (+47%), SOL 16.41→21.44 (+31%), BTC 3.58→3.93 (+10%). The single biggest feature.
+- Per-asset max_risk: BTC 4.23→5.09, LINK 4.41→5.72. Amplifies positive edge.
+- LINK leverage push: default 6→15x, min 2.5→6x, Kelly 0.65→0.80 = 3.38→5.72%/mo
+- BTC leverage push: default 4.5→6.5x, min 3→4.5x, Kelly 0.55→0.75 = 3.17→5.09%/mo
+- LINK wider MR target (0.7→0.85): +0.18%/mo from bigger MR winners
+
+**What failed (tried and reverted in this round):**
+- Partial profit at 1.5 ATR — killed big winners (BTC 3.38→1.63, SOL 16.41→6.13)
+- BTC pyramid at 2 ATR — DD exploded to 29% (reversed before add was safe)
+- BTC pyramid at 2.5 ATR / 30% — DD 32%, worse than 3 ATR / 50%
+- Double pyramid (add at 2 ATR then 5 ATR) — second add hurts all assets
+- LINK MR in TRANSITION — 211 trades, 34% WR, 65.5% DD, catastrophic
+- BTC wider RSI (40/60) — added 14 bad trades, went from 4.23→2.25
+- BTC SIDEWAYS breakout min_score 70 — removed profitable trades, 4.23→3.16
+- BTC sharper confidence differentiation — reduced total capital deployment
+- BTC faster time exit (10 bars) — cut winners that would have recovered
+- BTC looser trailing stop — gave back too much profit on winners
+- ETH VB in SIDEWAYS — slightly worse quality
+- BTC-ALT correlation lag — near-zero lagged correlation, useless as leading indicator
+- DD-adaptive Kelly — barely affected anything, Kelly already handles this
+
+## All Key Lessons (V13.0 to V13.13)
 - **Don't add trade types blindly** — trend following and MR-in-transition both failed badly
 - **Regime filtering is correct** — the MR edge ONLY exists in SIDEWAYS. Don't try to expand.
 - **Per-asset optimization is the key** — BB period, RSI, stops, targets all asset-specific
-- **Position sizing matters as much as signals** — max risk 5%→8% was +1%/mo improvement
+- **Position sizing matters as much as signals** — max risk 5%→8%→11% was cumulative +3%/mo
 - **Tighter stops + wider targets = better R:R** — SOL went from 9.84 to 15.01 just from this
 - **Kelly fraction undersizing** was the biggest drag on BTC/ETH/LINK performance
 - **Don't over-optimize cooldown** — 4 bars is the sweet spot, 2 bars adds bad trades
 - **MR trailing stops hurt more than help** — MR trades should reach target or stop, not trail
 - **VWAP bounce is asset-specific** — great for ETH/LINK, terrible for BTC/SOL
 - **Confidence multipliers need DD budget** — only apply to assets with DD headroom
-- **Per-asset default leverage is crucial** — LINK went from 1.63→3.38 just from default 3→6
+- **Per-asset default leverage is crucial** — LINK went from 1.63→3.38→5.72 through leverage alone
 - **Leverage boost > new signals for BTC** — BTC gains came from sizing, not new entries
 - **Breakeven stop must be generous** — 2 ATR threshold with 0.5 ATR buffer, not 1 ATR
+- **Pyramiding is the #1 feature for breakout strategies** — ETH +47%, SOL +31% from pyramid alone
+- **Partial profit kills breakout strategies** — taking 50% at 1.5 ATR cut returns by 50%+
+- **Per-asset max_risk_pct is a powerful lever** — BTC 8%→11% pushed from 4.23→5.09
+- **Per-asset pyramid thresholds matter** — BTC needs 3 ATR (DD-sensitive), others can use 2 ATR
+- **Confidence scoring predicts BTC quality** — low-score trades lose money, but soft filter is better than hard filter
+- **BTC-ALT correlation lag is a dead end** — near-zero lagged correlation, no leading indicator effect

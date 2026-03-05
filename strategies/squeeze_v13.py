@@ -27,10 +27,10 @@ ASSET_DIRECTION_FILTER = {
 
 # Per-asset Kelly fractions (SOL has strongest edge in DB)
 ASSET_KELLY = {
-    "BTC": 0.55,
-    "ETH": 0.45,
+    "BTC": 0.75,  # push harder — DD 24% has small room
+    "ETH": 0.50,  # slight push from 0.45
     "SOL": 0.55,
-    "LINK": 0.65,  # high quality signal — bet more
+    "LINK": 0.80,  # highest quality signal + massive DD headroom (13.8%)
 }
 
 # Per-asset breakout stop/target ATR multipliers
@@ -74,18 +74,47 @@ ASSET_BB_PERIOD = {
 
 # Per-asset minimum leverage floors (positive-edge assets shouldn't go below this)
 ASSET_MIN_LEVERAGE = {
-    "BTC": 3.0,
-    "ETH": 2.0,
+    "BTC": 4.5,  # push floor — BTC always has edge
+    "ETH": 2.5,  # slight push
     "SOL": 3.0,
-    "LINK": 2.5,
+    "LINK": 6.0,  # push floor hard — DD only 13.8%
 }
 
 # Per-asset max leverage to control drawdown
 ASSET_MAX_LEVERAGE = {
-    "BTC": 12.0,  # DD 14.2% — room to push further
-    "ETH": 6.0,  # pushed from 5.0 — DD 20% has room
+    "BTC": 15.0,  # DD ~24% — can't push more
+    "ETH": 7.0,  # DD ~23% — controlled
     "SOL": 8.0,
-    "LINK": 12.0,  # DD only 11.1% — massive room to lever up
+    "LINK": 15.0,  # DD 18.5%
+}
+
+# Hour-of-day edges: favorable hours get confidence boost, bad hours get penalty
+# Based on data analysis of hourly returns across 1524 samples per hour
+ASSET_GOOD_HOURS = {
+    "BTC": {22, 20, 8, 21, 15, 14, 10},
+    "ETH": {22, 21, 3, 11, 20, 4, 5, 9},
+    "SOL": {22, 3, 11, 4, 9, 5, 10, 7, 18, 0, 2},
+    "LINK": {22, 3, 9, 5, 4, 20, 21, 7},
+}
+ASSET_BAD_HOURS = {
+    "BTC": {23, 19, 13, 1, 16},
+    "ETH": {13, 1, 23, 6, 16},
+    "SOL": {16, 13, 19, 23, 12},
+    "LINK": {17, 13, 16, 1, 8, 0, 12, 19, 23},
+}
+
+# Best TA-Lib patterns per asset (from exhaustive scan)
+ASSET_BULL_PATTERNS = {
+    "BTC": ["CDLSEPARATINGLINES", "CDLHIKKAKEMOD", "CDLHARAMICROSS"],
+    "ETH": ["CDLHIKKAKEMOD"],
+    "SOL": ["CDLSEPARATINGLINES", "CDLHARAMICROSS", "CDL3WHITESOLDIERS", "CDLHIKKAKEMOD"],
+    "LINK": ["CDL3WHITESOLDIERS", "CDLHIKKAKEMOD"],
+}
+ASSET_BEAR_PATTERNS = {
+    "BTC": ["CDLMARUBOZU", "CDLHANGINGMAN", "CDLSTALLEDPATTERN"],
+    "ETH": ["CDLIDENTICAL3CROWS", "CDLHIKKAKEMOD", "CDLADVANCEBLOCK", "CDLSTALLEDPATTERN"],
+    "SOL": ["CDLSTALLEDPATTERN", "CDLHIKKAKEMOD", "CDLIDENTICAL3CROWS"],
+    "LINK": ["CDLIDENTICAL3CROWS", "CDLADVANCEBLOCK", "CDLHANGINGMAN", "CDLSEPARATINGLINES", "CDLHIKKAKE"],
 }
 
 
@@ -109,7 +138,7 @@ class SqueezeV13:
         self.kelly_window = kelly_window
         self.max_leverage = max_leverage
         # Per-asset default leverage (used when Kelly has insufficient history)
-        ASSET_DEFAULT_LEV = {"BTC": 4.5, "ETH": 3.0, "SOL": 3.0, "LINK": 6.0}
+        ASSET_DEFAULT_LEV = {"BTC": 6.5, "ETH": 3.5, "SOL": 3.0, "LINK": 15.0}
         self.default_leverage = ASSET_DEFAULT_LEV.get(asset_name, default_leverage)
         self.asset_name = asset_name
 
@@ -148,6 +177,8 @@ class SqueezeV13:
         self._entry_bar = -1
         self._trade_type = None  # "breakout" or "meanrev"
         self._breakeven_set = False  # track if stop moved to breakeven
+        self._pyramid_count = 0  # track pyramid adds (max 2)
+        self._entry_atr = 0  # ATR at entry for R-multiple calculations
 
         # Rolling trade history for Kelly
         self._trade_history = []
@@ -169,6 +200,8 @@ class SqueezeV13:
         self._entry_bar = -1
         self._trade_type = None
         self._breakeven_set = False
+        self._pyramid_count = 0
+        self._entry_atr = 0
         self._trade_history = []
         self.regime_counts = {"TRENDING": 0, "SIDEWAYS": 0, "VOLATILE": 0, "TRANSITION": 0}
         self.trade_regimes = []
@@ -295,6 +328,21 @@ class SqueezeV13:
         spinningtop = pd.Series(talib.CDLSPINNINGTOP(o, h, l, c), index=data.index)
         weak_candle = ((doji != 0) | (spinningtop != 0)).astype(int)
 
+        # Extended TA-Lib patterns for confidence scoring
+        separatinglines = pd.Series(talib.CDLSEPARATINGLINES(o, h, l, c), index=data.index)
+        hikkakemod = pd.Series(talib.CDLHIKKAKEMOD(o, h, l, c), index=data.index)
+        haramicross = pd.Series(talib.CDLHARAMICROSS(o, h, l, c), index=data.index)
+        threews = pd.Series(talib.CDL3WHITESOLDIERS(o, h, l, c), index=data.index)
+        identical3crows = pd.Series(talib.CDLIDENTICAL3CROWS(o, h, l, c), index=data.index)
+        advanceblock = pd.Series(talib.CDLADVANCEBLOCK(o, h, l, c), index=data.index)
+        stalledpattern = pd.Series(talib.CDLSTALLEDPATTERN(o, h, l, c), index=data.index)
+        hangingman = pd.Series(talib.CDLHANGINGMAN(o, h, l, c), index=data.index)
+        marubozu = pd.Series(talib.CDLMARUBOZU(o, h, l, c), index=data.index)
+        hikkake = pd.Series(talib.CDLHIKKAKE(o, h, l, c), index=data.index)
+
+        # Hour of day
+        hour = pd.Series(data.index.hour, index=data.index)
+
         self._ind = pd.DataFrame({
             "close": closes, "high": highs, "low": lows, "open": opens,
             "ema8": ema8, "ema21": ema21, "ema55": ema55,
@@ -320,6 +368,18 @@ class SqueezeV13:
             "ema_4h_slope": ema_4h_slope, "mtf_bull": mtf_bull,
             "rsi_daily": rsi_daily,
             "atr_ratio": atr_ratio, "recent_vol_spike": recent_vol_spike,
+            # Extended TA-Lib patterns
+            "pat_separatinglines": separatinglines,
+            "pat_hikkakemod": hikkakemod,
+            "pat_haramicross": haramicross,
+            "pat_3whitesoldiers": threews,
+            "pat_identical3crows": identical3crows,
+            "pat_advanceblock": advanceblock,
+            "pat_stalledpattern": stalledpattern,
+            "pat_hangingman": hangingman,
+            "pat_marubozu": marubozu,
+            "pat_hikkake": hikkake,
+            "hour": hour,
         }, index=data.index)
 
     def _compute_adx(self, highs, lows, closes, period=14):
@@ -466,6 +526,7 @@ class SqueezeV13:
             return 1.5  # negative edge: low but not minimum
 
         leverage = kelly * self.kelly_fraction * 20
+
         min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
         return max(min_lev, min(leverage, self.max_leverage))
 
@@ -475,9 +536,9 @@ class SqueezeV13:
         Score 50-100 maps to leverage multiplier:
         50-60: 0.8x (marginal — reduce size)
         60-70: 1.0x (normal)
-        70-80: 1.5x (good confluence)
-        80-90: 2.0x (strong confluence)
-        90+:   2.5x (exceptional — max conviction)
+        70-80: 1.3x (good confluence)
+        80-90: 1.8x (strong confluence)
+        90+:   2.2x (exceptional — max conviction)
         """
         ind = self._ind.iloc[i]
         score = 50  # base
@@ -546,17 +607,82 @@ class SqueezeV13:
             except Exception:
                 pass
 
+        # Hour-of-day edge (+8 / -5)
+        hour = int(ind["hour"]) if not pd.isna(ind["hour"]) else 12
+        good_hours = ASSET_GOOD_HOURS.get(self.asset_name, set())
+        bad_hours = ASSET_BAD_HOURS.get(self.asset_name, set())
+        if hour in good_hours:
+            score += 8
+        elif hour in bad_hours:
+            score -= 5
+
+        # TA-Lib pattern confirmation (+10)
+        pat_score = self._check_talib_patterns(ind, direction)
+        score += pat_score
+
         score = max(40, min(score, 100))
 
-        # Map score to leverage multiplier (only used for BTC)
-        if score >= 80:
-            return 1.5
+        # SOL: already high returns, confidence mult adds DD risk without benefit
+        if self.asset_name == "SOL":
+            return 1.0
+
+        # Map score to leverage multiplier
+        if score >= 90:
+            return 2.2
+        elif score >= 80:
+            return 1.8
         elif score >= 70:
             return 1.3
         elif score >= 60:
             return 1.1
+        elif score < 50:
+            return 0.8
         else:
             return 1.0
+
+    def _check_talib_patterns(self, ind, direction):
+        """Check best TA-Lib patterns for this asset and direction. Returns score bonus."""
+        asset = self.asset_name
+        bonus = 0
+
+        if direction == "LONG":
+            patterns = ASSET_BULL_PATTERNS.get(asset, [])
+            pat_map = {
+                "CDLSEPARATINGLINES": "pat_separatinglines",
+                "CDLHIKKAKEMOD": "pat_hikkakemod",
+                "CDLHARAMICROSS": "pat_haramicross",
+                "CDL3WHITESOLDIERS": "pat_3whitesoldiers",
+            }
+            for pat in patterns:
+                col = pat_map.get(pat)
+                if col and col in ind.index and ind[col] > 0:
+                    bonus += 5
+        else:  # SHORT
+            patterns = ASSET_BEAR_PATTERNS.get(asset, [])
+            pat_map = {
+                "CDLMARUBOZU": "pat_marubozu",
+                "CDLHANGINGMAN": "pat_hangingman",
+                "CDLSTALLEDPATTERN": "pat_stalledpattern",
+                "CDLIDENTICAL3CROWS": "pat_identical3crows",
+                "CDLHIKKAKEMOD": "pat_hikkakemod",
+                "CDLADVANCEBLOCK": "pat_advanceblock",
+                "CDLSEPARATINGLINES": "pat_separatinglines",
+                "CDLHIKKAKE": "pat_hikkake",
+            }
+            for pat in patterns:
+                col = pat_map.get(pat)
+                if col and col in ind.index:
+                    # Bear patterns: check for negative signal (bearish)
+                    # Some patterns always signal negative for bearish
+                    val = ind[col]
+                    if pat in ("CDLHIKKAKEMOD", "CDLIDENTICAL3CROWS", "CDLADVANCEBLOCK",
+                               "CDLSTALLEDPATTERN", "CDLHIKKAKE", "CDLSEPARATINGLINES"):
+                        if val < 0:
+                            bonus += 5
+                    elif val > 0:  # hangingman, marubozu signal positive but mean bearish
+                        bonus += 5
+
+        return min(bonus, 10)  # cap at +10
 
     def _regime_leverage_mult(self, regime, trend, direction):
         if regime == "VOLATILE":
@@ -627,7 +753,7 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("LONG")
             regime_mult = self._regime_leverage_mult(regime, trend, "LONG")
-            conf_mult = self._unified_confidence(i, "LONG", "breakout") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            conf_mult = self._unified_confidence(i, "LONG", "breakout")
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
@@ -637,6 +763,8 @@ class SqueezeV13:
             self._best_price = price
             self._entry_bar = i
             self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
             self._trade_type = "breakout"
 
             return {
@@ -671,7 +799,7 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("SHORT")
             regime_mult = self._regime_leverage_mult(regime, trend, "SHORT")
-            conf_mult = self._unified_confidence(i, "SHORT", "breakout") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            conf_mult = self._unified_confidence(i, "SHORT", "breakout")
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
@@ -681,6 +809,8 @@ class SqueezeV13:
             self._best_price = price
             self._entry_bar = i
             self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
             self._trade_type = "breakout"
 
             return {
@@ -714,6 +844,10 @@ class SqueezeV13:
 
         vwap_dist = float(ind["vwap_dist"]) if not pd.isna(ind["vwap_dist"]) else 0
 
+        # Per-asset MR target extension (% of way to opposite band)
+        MR_TARGET_EXT = {"BTC": 0.7, "ETH": 0.7, "SOL": 0.7, "LINK": 0.85}
+        mr_target_pct = MR_TARGET_EXT.get(self.asset_name, 0.7)
+
         # LONG: price near lower BB + RSI oversold + Williams %R oversold + bullish candle
         if (price <= bb_lower * (1 + self.mr_bb_entry_pct) and
             rsi < self.mr_rsi_long and
@@ -726,7 +860,7 @@ class SqueezeV13:
 
             stop = price - (atr * self.mr_stop_atr)
             # Target beyond BB mid — aim for 70% of the way to upper BB
-            target = bb_mid + (bb_upper - bb_mid) * 0.7
+            target = bb_mid + (bb_upper - bb_mid) * mr_target_pct
 
             gain_dist = target - price
             loss_dist = price - stop
@@ -735,7 +869,7 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("LONG")
             regime_mult = self._regime_leverage_mult(regime, trend, "LONG")
-            conf_mult = self._unified_confidence(i, "LONG", "meanrev") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            conf_mult = self._unified_confidence(i, "LONG", "meanrev")
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
@@ -743,6 +877,8 @@ class SqueezeV13:
             self._best_price = price
             self._entry_bar = i
             self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
             self._trade_type = "meanrev"
 
             return {
@@ -765,7 +901,7 @@ class SqueezeV13:
 
             stop = price + (atr * self.mr_stop_atr)
             # Target beyond BB mid — aim for 70% of the way to lower BB
-            target = bb_mid - (bb_mid - bb_lower) * 0.7
+            target = bb_mid - (bb_mid - bb_lower) * mr_target_pct
 
             gain_dist = price - target
             loss_dist = stop - price
@@ -774,7 +910,7 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("SHORT")
             regime_mult = self._regime_leverage_mult(regime, trend, "SHORT")
-            conf_mult = self._unified_confidence(i, "SHORT", "meanrev") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            conf_mult = self._unified_confidence(i, "SHORT", "meanrev")
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
@@ -782,6 +918,8 @@ class SqueezeV13:
             self._best_price = price
             self._entry_bar = i
             self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
             self._trade_type = "meanrev"
 
             return {
@@ -842,6 +980,8 @@ class SqueezeV13:
             self._best_price = price
             self._entry_bar = i
             self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
             self._trade_type = "breakout"  # use breakout exit logic (trailing)
 
             return {
@@ -877,6 +1017,8 @@ class SqueezeV13:
             self._best_price = price
             self._entry_bar = i
             self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
             self._trade_type = "breakout"
 
             return {
@@ -926,7 +1068,7 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("LONG")
             regime_mult = 2.0  # high conviction override
-            conf_mult = self._unified_confidence(i, "LONG", "meanrev") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            conf_mult = self._unified_confidence(i, "LONG", "meanrev")
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
@@ -934,6 +1076,8 @@ class SqueezeV13:
             self._best_price = price
             self._entry_bar = i
             self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
             self._trade_type = "meanrev"
 
             return {
@@ -964,7 +1108,7 @@ class SqueezeV13:
 
             kelly_lev = self._compute_kelly("SHORT")
             regime_mult = 2.0
-            conf_mult = self._unified_confidence(i, "SHORT", "meanrev") if self.asset_name in ("BTC", "ETH", "LINK") else 1.0
+            conf_mult = self._unified_confidence(i, "SHORT", "meanrev")
             min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
             lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
 
@@ -972,6 +1116,8 @@ class SqueezeV13:
             self._best_price = price
             self._entry_bar = i
             self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
             self._trade_type = "meanrev"
 
             return {
@@ -1104,6 +1250,26 @@ class SqueezeV13:
         return None
 
     def _check_exit_breakout(self, i, price, atr, trade):
+        entry_atr = self._entry_atr if self._entry_atr > 0 else atr
+
+        # Pyramiding: add to winner (once per trade)
+        # Per-asset: ATR threshold and add percentage
+        PYRAMID_CFG = {
+            "BTC": (3.0, 50),
+            "ETH": (2.0, 50),
+            "SOL": (2.0, 50),
+            "LINK": (2.0, 50),
+        }
+        pyr_thresh, pyr_pct = PYRAMID_CFG.get(self.asset_name, (3.0, 50))
+        if self._pyramid_count == 0:
+            if trade.direction == "LONG":
+                pnl_atr = (price - trade.entry_price) / entry_atr
+            else:
+                pnl_atr = (trade.entry_price - price) / entry_atr
+            if pnl_atr >= pyr_thresh:
+                self._pyramid_count += 1
+                return f"PYRAMID_{pyr_pct}"
+
         # Breakeven stop: after 2 ATR in profit, move stop to entry + 0.5 ATR
         if not self._breakeven_set:
             if trade.direction == "LONG":
@@ -1123,7 +1289,7 @@ class SqueezeV13:
                         trade.stop_price = be_stop
                     self._breakeven_set = True
 
-        # Improved time exit: only exit unprofitable trades after 12 bars (was 10)
+        # Time exit: exit unprofitable trades after 12 bars
         if i - self._entry_bar >= 12:
             if trade.direction == "LONG":
                 pnl_r = (price - trade.entry_price) / atr

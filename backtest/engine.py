@@ -150,13 +150,28 @@ class BacktestEngine:
                     stop = signal.get("stop", 0)
                     target = signal.get("target", 0)
                     
-                    # Position sizing: risk max_risk_pct of capital
+                    # Dynamic leverage from signal (if provided)
+                    sig_leverage = signal.get("leverage", 1.0)
+                    
+                    # Position sizing for leveraged perps:
+                    # You deposit margin, control leverage * margin in position
+                    # Risk is still capped at max_risk_pct of CAPITAL (not position)
                     risk_per_unit = abs(price - stop) if stop else price * 0.02
-                    if risk_per_unit > 0:
-                        size = min(capital, (capital * self.max_risk_pct) / (risk_per_unit / price) )
-                    else:
-                        size = capital * self.max_risk_pct
-                    size = min(size, capital * 0.5)  # Never use more than 50% on one trade
+                    risk_pct = risk_per_unit / price if price > 0 else 0.02
+                    
+                    # How much margin to use (capped at 40% of capital)
+                    margin = min(capital * 0.4, capital)
+                    
+                    # Position size = margin * leverage
+                    size = margin * sig_leverage
+                    
+                    # But cap so that a stop-loss hit doesn't lose more than max_risk_pct of capital
+                    max_loss = capital * self.max_risk_pct
+                    loss_per_unit = risk_per_unit * (size / price) if price > 0 else max_loss
+                    if loss_per_unit > max_loss and risk_per_unit > 0:
+                        size = max_loss / (risk_per_unit / price)
+                    
+                    size = min(size, capital * sig_leverage)  # Can't exceed leverage * capital
                     
                     open_trade = Trade(
                         entry_time=data.index[i],

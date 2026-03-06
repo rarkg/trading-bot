@@ -46,3 +46,21 @@ Changes:
 
 Result: ALL assets beat original V14 targets. BTC/SOL/LINK DD <25%. ETH DD 27.8% is structural.
 All OOS pass. V14 comparison uses same risk params (apples-to-apples).
+
+## V15.3 — ETH DD fix via leverage/risk rebalance
+Changes:
+- ETH: max_lev 7.0→5.5, max_risk 16→25% (lower leverage, higher risk budget → fewer large losses)
+- Key insight: ETH DD was leverage-driven. Lower max_lev + higher max_risk means more trades at moderate size rather than fewer trades at extreme size. Reduces DD from 27.8% to 23.5%.
+
+| Asset | %/mo   | V14 orig | Delta  | DD    | Trades | WR  | PF   |
+|-------|--------|----------|--------|-------|--------|-----|------|
+| BTC   | +3.57  | +3.41    | +0.16  | 23.1% | 123    | 34% | 1.51 |
+| ETH   | +9.30  | +6.86    | +2.44  | 23.5% | 101    | 49% | 3.75 |
+| SOL   | +22.07 | +22.07   | 0.00   | 24.4% | 120    | 47% | 2.31 |
+| LINK  | +8.24  | +7.96    | +0.28  | 24.8% | 35     | 57% | 4.34 |
+| **Avg** | **+10.80** | | | | | | |
+
+**ALL TARGETS MET:**
+- All 4 assets match or beat V14 on %/mo ✓
+- All 4 assets DD < 25% ✓ (max: LINK 24.8%)
+- All OOS pass ✓

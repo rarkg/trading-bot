@@ -231,7 +231,7 @@ def main():
     total_bars = len(sample)
     date_range = f"{sample.index[0].date()} to {sample.index[-1].date()}"
 
-    ASSET_MAX_RISK = {"BTC": 42.0, "ETH": 16.0, "SOL": 8.0, "LINK": 13.0}  # V15.2: ETH 10.5→16, LINK 11→13
+    ASSET_MAX_RISK = {"BTC": 42.0, "ETH": 25.0, "SOL": 8.0, "LINK": 13.0}  # V15.3: ETH 16→25 (comp for lower lev)
 
     print("=" * 90)
     print("  V15 CROSS-ASSET BACKTEST — Hybrid Adaptive Strategy")

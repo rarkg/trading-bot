@@ -32,7 +32,7 @@ ASSET_MIN_LEVERAGE = {
 }
 
 ASSET_MAX_LEVERAGE = {
-    "BTC": 14.0, "ETH": 7.0, "SOL": 8.0, "LINK": 12.8,  # V15.2: BTC 15→14, LINK 16→12.8 (DD control)
+    "BTC": 14.0, "ETH": 5.5, "SOL": 8.0, "LINK": 12.8,  # V15.3: ETH 7→5.5 (DD 27.8→23.5%)
 }
 
 ASSET_BULL_PATTERNS = {

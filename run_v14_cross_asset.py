@@ -268,7 +268,7 @@ def main():
     v14_kelly = {}
     v14_strats = {}
 
-    ASSET_MAX_RISK = {"BTC": 11.0, "ETH": 9.0, "SOL": 8.0, "LINK": 11.0}
+    ASSET_MAX_RISK = {"BTC": 42.0, "ETH": 10.5, "SOL": 8.0, "LINK": 11.0}
 
     # V14: Precompute cross-asset momentum (24h ROC trend for each asset)
     asset_trends = {}

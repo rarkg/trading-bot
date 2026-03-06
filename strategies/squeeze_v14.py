@@ -31,8 +31,8 @@ ASSET_DIRECTION_FILTER = {
 
 # Per-asset Kelly fractions (SOL has strongest edge in DB)
 ASSET_KELLY = {
-    "BTC": 0.75,  # V13 value — DD-constrained at 25%
-    "ETH": 0.55,  # V14: push from 0.50
+    "BTC": 0.75,
+    "ETH": 0.60,  # V14.3: push from 0.55
     "SOL": 0.55,
     "LINK": 0.85,  # V14: push from 0.80
 }
@@ -78,8 +78,8 @@ ASSET_BB_PERIOD = {
 
 # Per-asset minimum leverage floors (positive-edge assets shouldn't go below this)
 ASSET_MIN_LEVERAGE = {
-    "BTC": 4.5,  # same as V13 — DD-constrained
-    "ETH": 3.0,  # V14: push from 2.5
+    "BTC": 6.0,  # V14.3: push from 4.5
+    "ETH": 3.5,  # V14.3: push from 3.0
     "SOL": 3.0,
     "LINK": 7.0,  # V14: push from 6.0
 }
@@ -87,7 +87,7 @@ ASSET_MIN_LEVERAGE = {
 # Per-asset max leverage to control drawdown
 ASSET_MAX_LEVERAGE = {
     "BTC": 15.0,  # DD ~24% — can't push more
-    "ETH": 7.0,  # V14: same as V13 — max_lev constrained
+    "ETH": 7.0,  # V14.3: keep at 7.0 — DD-constrained
     "SOL": 8.0,
     "LINK": 16.0,  # V14: push from 15.0
 }
@@ -142,7 +142,7 @@ class SqueezeV14:
         self.kelly_window = kelly_window
         self.max_leverage = max_leverage
         # Per-asset default leverage (used when Kelly has insufficient history)
-        ASSET_DEFAULT_LEV = {"BTC": 6.5, "ETH": 4.0, "SOL": 3.0, "LINK": 15.0}
+        ASSET_DEFAULT_LEV = {"BTC": 6.5, "ETH": 5.0, "SOL": 3.0, "LINK": 15.0}
         self.default_leverage = ASSET_DEFAULT_LEV.get(asset_name, default_leverage)
         self.asset_name = asset_name
 
@@ -647,14 +647,14 @@ class SqueezeV14:
         pat_score = self._check_talib_patterns(ind, direction)
         score += pat_score
 
-        # V14: Cross-asset momentum factor (+12, boost only — no penalty)
-        # Skip for BTC (already the market leader) and SOL (already high returns)
+        # V14: Cross-asset momentum factor (boost only — no penalty)
+        # Skip for BTC and SOL
         if self.asset_name not in ("BTC", "SOL"):
             cam = self._cross_asset_momentum
             if direction == "LONG" and cam > 0.5:
-                score += 12  # 3/4 assets bullish → strong long bias
+                score += 12
             elif direction == "SHORT" and cam < -0.5:
-                score += 12  # 3/4 bearish → strong short bias
+                score += 12
 
         score = max(40, min(score, 100))
 
@@ -725,7 +725,7 @@ class SqueezeV14:
             return 0.5
         if regime == "TRANSITION":
             # V14: Per-asset TRANSITION mult
-            TRANS_MULT = {"BTC": 2.0, "ETH": 2.0, "SOL": 2.0, "LINK": 2.5}
+            TRANS_MULT = {"BTC": 2.5, "ETH": 2.0, "SOL": 2.0, "LINK": 2.5}
             return TRANS_MULT.get(self.asset_name, 2.0)
         if regime == "TRENDING":
             if (direction == "LONG" and trend == "UP") or (direction == "SHORT" and trend == "DOWN"):
@@ -887,7 +887,7 @@ class SqueezeV14:
         vwap_dist = float(ind["vwap_dist"]) if not pd.isna(ind["vwap_dist"]) else 0
 
         # Per-asset MR target extension (% of way to opposite band)
-        MR_TARGET_EXT = {"BTC": 0.7, "ETH": 0.7, "SOL": 0.7, "LINK": 0.90}
+        MR_TARGET_EXT = {"BTC": 0.85, "ETH": 0.85, "SOL": 0.7, "LINK": 0.90}
         mr_target_pct = MR_TARGET_EXT.get(self.asset_name, 0.7)
 
         # LONG: price near lower BB + RSI oversold + Williams %R oversold + bullish candle
@@ -1077,6 +1077,114 @@ class SqueezeV14:
 
         return None
 
+    def _try_momentum_continuation(self, data, i, regime):
+        """ETH-only: ride momentum when EMA8 freshly crosses EMA21 with volume + MTF confirmation."""
+        if self.asset_name != "ETH":
+            return None
+        ind = self._ind.iloc[i]
+        price = float(ind["close"])
+        atr = float(ind["atr"])
+        if pd.isna(atr) or atr <= 0:
+            return None
+
+        ema8 = float(ind["ema8"])
+        ema21 = float(ind["ema21"])
+        vol_ratio = float(ind["vol_ratio"])
+        rsi = float(ind["rsi"])
+        mtf_bull = int(ind["mtf_bull"]) if not pd.isna(ind["mtf_bull"]) else 0
+        ema_4h_slope = float(ind["ema_4h_slope"]) if not pd.isna(ind["ema_4h_slope"]) else 0
+        trend = self._daily_trend(i)
+
+        # Check for fresh EMA crossover (within last 3 bars)
+        if i < 3:
+            return None
+        prev_ema8 = [float(self._ind.iloc[i-j]["ema8"]) for j in range(1, 4)]
+        prev_ema21 = [float(self._ind.iloc[i-j]["ema21"]) for j in range(1, 4)]
+
+        # LONG: EMA8 just crossed above EMA21, confirmed by MTF + volume
+        fresh_bull_cross = (ema8 > ema21 and any(p8 < p21 for p8, p21 in zip(prev_ema8, prev_ema21)))
+        if (fresh_bull_cross and
+            trend == "UP" and
+            mtf_bull == 1 and
+            ema_4h_slope > 0.1 and
+            vol_ratio > 1.3 and
+            40 <= rsi <= 65 and
+            ind["body_ratio"] > 0.4 and
+            ind["bullish"] == 1):
+
+            if not self._direction_allowed("LONG", i, regime):
+                return None
+            if self._btc_crashed(data.index[i]):
+                return None
+
+            stop = price - (atr * 2.0)
+            target = price + (atr * 8.0)
+
+            kelly_lev = self._compute_kelly("LONG")
+            regime_mult = self._regime_leverage_mult(regime, trend, "LONG")
+            conf_mult = self._unified_confidence(i, "LONG", "breakout")
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
+
+            self._trailing_stop = stop
+            self._best_price = price
+            self._entry_bar = i
+            self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
+            self._entry_volume = float(ind["volume"])
+            self._trade_type = "breakout"
+
+            return {
+                "action": "LONG",
+                "signal": f"V14_MC_L(rsi{rsi:.0f},r{regime[0]},l{lev:.1f}x)",
+                "stop": stop,
+                "target": target,
+                "leverage": lev,
+            }
+
+        # SHORT: EMA8 just crossed below EMA21
+        fresh_bear_cross = (ema8 < ema21 and any(p8 > p21 for p8, p21 in zip(prev_ema8, prev_ema21)))
+        if (fresh_bear_cross and
+            trend == "DOWN" and
+            mtf_bull == 0 and
+            ema_4h_slope < -0.1 and
+            vol_ratio > 1.3 and
+            35 <= rsi <= 60 and
+            ind["body_ratio"] > 0.4 and
+            ind["bullish"] == 0):
+
+            if not self._direction_allowed("SHORT", i, regime):
+                return None
+
+            stop = price + (atr * 2.0)
+            target = price - (atr * 8.0)
+
+            kelly_lev = self._compute_kelly("SHORT")
+            regime_mult = self._regime_leverage_mult(regime, trend, "SHORT")
+            conf_mult = self._unified_confidence(i, "SHORT", "breakout")
+            min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 1.5)
+            lev = round(max(min_lev, min(kelly_lev * regime_mult * conf_mult, self.max_leverage)), 2)
+
+            self._trailing_stop = stop
+            self._best_price = price
+            self._entry_bar = i
+            self._breakeven_set = False
+            self._pyramid_count = 0
+            self._entry_atr = atr
+            self._entry_volume = float(ind["volume"])
+            self._trade_type = "breakout"
+
+            return {
+                "action": "SHORT",
+                "signal": f"V14_MC_S(rsi{rsi:.0f},r{regime[0]},l{lev:.1f}x)",
+                "stop": stop,
+                "target": target,
+                "leverage": lev,
+            }
+
+        return None
+
     def _try_overextension_mr(self, data, i, regime):
         """High-conviction MR when RSI is extremely overextended. Works in ALL regimes.
 
@@ -1250,6 +1358,12 @@ class SqueezeV14:
                         return None
                 self.regime_counts["TRANSITION"] += 1
                 self.trade_regimes.append((regime, signal["action"], "breakout"))
+                return signal
+            # V14.3: Momentum continuation for ETH
+            signal = self._try_momentum_continuation(data, i, regime)
+            if signal:
+                self.regime_counts["TRANSITION"] += 1
+                self.trade_regimes.append((regime, signal["action"], "momentum"))
                 return signal
             # VWAP bounce in TRANSITION
             signal = self._try_vwap_bounce(data, i, regime)

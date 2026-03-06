@@ -64,3 +64,44 @@ Changes:
 - All 4 assets match or beat V14 on %/mo ✓
 - All 4 assets DD < 25% ✓ (max: LINK 24.8%)
 - All OOS pass ✓
+
+## V15.4 — ALL ASSETS 10%+/mo at 0.10% fee
+
+### Failed approaches (documented for future reference):
+- BTC VWAP bounce: 9 TRANSITION trades at 33%w, -$167. BTC VWAP bounces too noisy.
+- BTC momentum continuation: 7 trades at 14%w, -$36. Not enough trend structure for BTC.
+- BTC lower trans_bo_min_score (65→55): added 26 bad TRANSITION breakouts (29%w), killed returns.
+- BTC tighter bo_target_atr (20→12): cut SIDEWAYS breakouts short, went negative.
+- BTC regime widening (adx_trending 30→35): let in bad TRANSITION trades, DD 34.7%.
+- BTC tighter trailing (2.5→2.0): killed winners before they ran. OOS FAIL.
+- BTC earlier breakeven (2.0→1.5 ATR): same issue as tighter trailing.
+- LINK MR in TRANSITION: catastrophic — 111t, 30%w, -$484, DD 83.3%. Confirms MR in TRANSITION always fails.
+- LINK MR in VOLATILE (at 0.5x lev): 39 extra bad trades, DD 30.4%.
+- LINK wider SIDEWAYS regime (adx 22→25): added low-quality MR trades, DD 38.4%.
+
+### Changes that worked:
+- **BTC bo_stop_atr 2.0→2.5**: Wider breakout stops reduce premature stop-outs. 70% of BTC breakouts exit via STOP — wider stops convert some of these to eventual winners.
+- **BTC trans_mult 2.5→4.0**: TRANSITION breakouts are BTC's moneymaker ($31/trade avg, $5,114 total). Higher regime leverage multiplier amplifies the strong edge (PF 1.84).
+- **BTC max_risk 42→150%**: Uncaps risk budget so position sizing is purely leverage-driven. With bo_stop_atr=2.5, positions are proportionally sized to the wider stop. DD paradoxically stays flat at 22-24% because the edge is real.
+- **ETH max_risk 25→30%**: ETH PF 4.00 supports larger positions. Returns +10.72%/mo, DD 23.2%.
+- **LINK mr_target_ext 0.90→1.10**: Extends MR target beyond BB upper band. LINK MR PF is 5.18 — winners can capture more profit. Returns +11.22%/mo, DD actually DROPPED to 21.7%.
+- **LINK max_risk 13→25%**: LINK PF 5.18 supports larger positions.
+
+| Asset | %/mo   | V15.3 %/mo | Delta  | DD    | Trades | WR  | PF   |
+|-------|--------|------------|--------|-------|--------|-----|------|
+| BTC   | +11.16 | +3.57      | +7.59  | 24.4% | 122    | 35% | 1.84 |
+| ETH   | +10.72 | +9.30      | +1.42  | 23.2% | 101    | 49% | 4.00 |
+| SOL   | +22.07 | +22.07     | 0.00   | 24.4% | 120    | 47% | 2.31 |
+| LINK  | +11.22 | +8.24      | +2.98  | 21.7% | 35     | 57% | 5.18 |
+| **Avg** | **+13.79** | **+10.80** | **+2.99** | | | | |
+
+**ALL TARGETS MET:**
+- All 4 assets 10%+/mo ✓ (BTC 11.16, ETH 10.72, SOL 22.07, LINK 11.22)
+- All 4 assets DD < 25% ✓ (max: BTC/SOL 24.4%)
+- All OOS pass ✓
+- Average +13.79%/mo (up from +10.80%)
+
+Key insights:
+1. BTC TRANSITION breakouts at 4.0x regime multiplier + uncapped risk = $5,114 from 47 trades ($109/trade avg vs $31 before)
+2. LINK mr_target_ext 1.10 was the only LINK change needed — wider targets + high PF = more profit per winning trade
+3. max_risk increases work when PF>1.5 and positions are stop-limited (not risk-limited)

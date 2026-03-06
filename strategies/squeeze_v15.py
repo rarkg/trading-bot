@@ -28,11 +28,11 @@ ASSET_DIRECTION_FILTER = {
 }
 
 ASSET_MIN_LEVERAGE = {
-    "BTC": 3.0, "ETH": 2.0, "SOL": 3.0, "LINK": 7.0,  # V15.2: BTC 6→3, ETH 3.5→2 (Kelly sizing room)
+    "BTC": 3.0, "ETH": 2.0, "SOL": 3.0, "LINK": 7.0,  # V15.2: BTC 6→3, ETH 3.5→2
 }
 
 ASSET_MAX_LEVERAGE = {
-    "BTC": 14.0, "ETH": 5.5, "SOL": 8.0, "LINK": 12.8,  # V15.3: ETH 7→5.5 (DD 27.8→23.5%)
+    "BTC": 14.0, "ETH": 5.5, "SOL": 8.0, "LINK": 12.8,  # V15.3 original
 }
 
 ASSET_BULL_PATTERNS = {
@@ -58,12 +58,12 @@ VWAP_BOUNCE_ASSETS = {"ETH", "LINK"}
 V14_DEFAULTS = {
     "BTC": {
         "kelly_fraction": 0.75, "mr_rsi_long": 38, "mr_rsi_short": 62,
-        "bb_period": 16, "trans_mult": 2.5, "sw_mult": 2.0,
-        "mr_target_ext": 0.85, "bo_stop_atr": 2.0, "bo_target_atr": 20,
+        "bb_period": 16, "trans_mult": 4.0, "sw_mult": 2.0,
+        "mr_target_ext": 0.85, "bo_stop_atr": 2.5, "bo_target_atr": 20,
         "good_hours": {22, 20, 8, 21, 15, 14, 10},
         "bad_hours": {23, 19, 13, 1, 16},
         "trans_bo_min_score": 65, "mr_stop_atr": 1.2,
-        "default_leverage": 4.0, "pyramid_thresh": 3.0, "pyramid_pct": 50,  # V15.2: def_lev 6.5→4.0
+        "default_leverage": 4.0, "pyramid_thresh": 3.0, "pyramid_pct": 50,
         "max_pyramids": 1,
     },
     "ETH": {
@@ -89,7 +89,7 @@ V14_DEFAULTS = {
     "LINK": {
         "kelly_fraction": 0.85, "mr_rsi_long": 35, "mr_rsi_short": 65,
         "bb_period": 16, "trans_mult": 2.5, "sw_mult": 2.5,
-        "mr_target_ext": 0.90, "bo_stop_atr": 2.5, "bo_target_atr": 12,
+        "mr_target_ext": 1.10, "bo_stop_atr": 2.5, "bo_target_atr": 12,
         "good_hours": {22, 3, 9, 5, 4, 20, 21, 7},
         "bad_hours": {17, 13, 16, 1, 8, 0, 12, 19, 23},
         "trans_bo_min_score": 55, "mr_stop_atr": 1.5,

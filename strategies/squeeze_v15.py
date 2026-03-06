@@ -28,11 +28,11 @@ ASSET_DIRECTION_FILTER = {
 }
 
 ASSET_MIN_LEVERAGE = {
-    "BTC": 6.0, "ETH": 3.5, "SOL": 3.0, "LINK": 7.0,
+    "BTC": 3.0, "ETH": 2.0, "SOL": 3.0, "LINK": 7.0,  # V15.2: BTC 6→3, ETH 3.5→2 (Kelly sizing room)
 }
 
 ASSET_MAX_LEVERAGE = {
-    "BTC": 15.0, "ETH": 7.0, "SOL": 8.0, "LINK": 16.0,
+    "BTC": 14.0, "ETH": 7.0, "SOL": 8.0, "LINK": 12.8,  # V15.2: BTC 15→14, LINK 16→12.8 (DD control)
 }
 
 ASSET_BULL_PATTERNS = {
@@ -63,7 +63,7 @@ V14_DEFAULTS = {
         "good_hours": {22, 20, 8, 21, 15, 14, 10},
         "bad_hours": {23, 19, 13, 1, 16},
         "trans_bo_min_score": 65, "mr_stop_atr": 1.2,
-        "default_leverage": 6.5, "pyramid_thresh": 3.0, "pyramid_pct": 50,
+        "default_leverage": 4.0, "pyramid_thresh": 3.0, "pyramid_pct": 50,  # V15.2: def_lev 6.5→4.0
         "max_pyramids": 1,
     },
     "ETH": {
@@ -137,7 +137,7 @@ class AdaptiveParameterManager:
         "BTC": 0.25,   # V14 hand-tuned, barely touch
         "SOL": 0.30,   # V14 hand-tuned, barely touch
         "ETH": 1.5,    # Under-tuned, more room to adapt
-        "LINK": 1.5,   # Under-tuned, more room to adapt
+        "LINK": 0.75,  # V15.2: tighter drift prevents kelly/sw_mult degradation
     }
 
     # Assets where hours should stay frozen (V14 hours are well-tuned)

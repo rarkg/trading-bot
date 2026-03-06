@@ -95,6 +95,70 @@ Changes: 9 best patterns only, scoring system from V2.1.3, 3x leverage T1, 2:2.5
 
 ---
 
+## V2.2.0 — Multi-Indicator Confirmation (score-based, all indicators)
+Changes: Added 11 indicators on top of baseline (StochRSI, Williams%R, MACD, CCI, EMA alignment, ATR percentile, Keltner, MFI, OBV slope, Range position, HH/LL). Score-based entry.
+
+### Iteration 1: Baseline + Individual Indicator Contribution
+
+**Baseline (RSI+BB+Vol+ADX, score>=2, R:R 2:2.5):** 44.3% avg WR
+
+**Individual indicator deltas (added to baseline, sorted by contribution):**
+| Indicator | Avg WR Delta | Notes |
+|-----------|-------------|-------|
+| EMA alignment (8/21/50) | +2.0% | Best single contributor |
+| OBV slope | +1.6% | Accumulation/distribution |
+| CCI | +0.6% | Oversold/overbought extremes |
+| Stochastic RSI | +0.6% | More sensitive momentum |
+| Range position | +0.5% | Where price is in recent range |
+| ATR percentile | +0.5% | Volatility context |
+| Williams %R | +0.3% | Marginal |
+| HH/LL detection | +0.2% | Negligible |
+| MACD | +0.1% | Negligible |
+| MFI | +0.1% | Negligible |
+| Keltner Channels | +0.1% | Negligible |
+
+**Key finding:** EMA alignment and OBV slope are the only meaningful contributors.
+
+### Iteration 2: Combine + R:R tuning
+
+**Best configs achieving 51%+ WR across all assets:**
+
+| Config | BTC | ETH | SOL | LINK | Avg | Trades | P&L |
+|--------|-----|-----|-----|------|-----|--------|-----|
+| All ind, R:R 3:2, ADX<20 | 60.1% | 61.4% | 59.1% | 61.3% | 60.5% | 2890 | -$2512 |
+| All ind, R:R 3:2, s>=3 | 61.1% | 59.6% | 60.5% | 58.5% | 59.9% | 6979 | -$3512 |
+| EMA+RSI+Vol s>=2, R:R 2:2 | 51.7% | 51.4% | 52.4% | 51.3% | 51.7% | 6544 | -$3263 |
+| EMA+OBV+CCI+Vol s>=2, R:R 2:2 | 53.2% | 50.6% | 52.0% | 51.8% | 51.9% | 8793 | -$3559 |
+| top5 s>=2 R:R 2:2 | 52.4% | 50.1% | 53.0% | 49.8% | 51.3% | 10388 | -$3715 |
+
+**MARUBOZU-only with all indicators, s>=4, R:R 2:2:** ETH 55.0%, SOL 51.9%, but BTC/LINK below 50%.
+
+**Short-only bias:** 51.1% avg (BTC 51.3%, LINK 51.6%) — shorts slightly better than longs.
+
+### V2.2 Best Config
+- **Indicators:** All 15 enabled
+- **R:R:** Stop 3.0 ATR / Target 2.0 ATR (asymmetric, wider stop)
+- **Score threshold:** >= 3.0
+- **ADX max:** 20 (only low-trend environments)
+- **Cooldown:** 16 bars
+- **Time exit:** 96 bars
+- **Avg WR: 60.5%** (BTC 60.1%, ETH 61.4%, SOL 59.1%, LINK 61.3%)
+- **Trades:** 2890 total (~720/asset over 4.2 years)
+- **P&L:** -$2,512 (unprofitable — R:R 3:2 needs 60% WR to break even, fees push breakeven to ~62%)
+
+### V2.2 Conclusions
+
+1. **WR > 51% target: ACHIEVED.** Multiple configs cross 51% on all assets.
+2. **WR 60.5% with asymmetric R:R** — widening stop (3 ATR) and tightening target (2 ATR) mechanically boosts WR. This is not "real" alpha — it's just R:R geometry.
+3. **The real edge is tiny.** At balanced R:R (2:2), best WR is 51.7% — only 1.7% above random. Fees (0.20%/roundtrip) destroy this edge.
+4. **EMA alignment is the single most valuable indicator** (+2.0% WR). OBV is second (+1.6%).
+5. **Hard filter mode** produces very few trades (426 with 4 indicators) but higher quality (49-51% WR).
+6. **Fundamental limitation:** Candlestick patterns + indicators on hourly data have an edge ceiling around 52% WR at balanced R:R. This is not enough to be a profitable standalone strategy after fees.
+7. **Curated 3-indicator combos (EMA+RSI+Vol or EMA+OBV+Vol)** perform as well as 15-indicator kitchen sink with 1/3 the complexity.
+8. **ADX < 20-25 dramatically improves WR** — patterns work best in low-trend / ranging markets.
+
+---
+
 ## Key Findings
 
 ### Which candlestick patterns work on hourly crypto?

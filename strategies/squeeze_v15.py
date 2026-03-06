@@ -104,19 +104,22 @@ V14_DEFAULTS = {
 # ============================================================
 
 class AdaptiveParameterManager:
-    """Self-tuning parameter manager. Recalibrates every 500 bars after 2000-bar warmup."""
+    """Self-tuning parameter manager. Recalibrates every 500 bars after 2000-bar warmup.
+
+    V15.1: Per-asset drift tiers. Well-tuned assets (BTC/SOL) barely drift from V14.
+    Under-tuned assets (ETH/LINK) get more room to adapt.
+    """
 
     WARMUP_BARS = 2000
     RECALIB_INTERVAL = 1000
 
-    # Max drift from V14 baseline (±fraction). Prevents cumulative over-correction.
-    # Tighter for params where V14 is already well-tuned.
+    # Base max drift from V14 baseline (±fraction).
     MAX_DRIFT = {
         "kelly_fraction": 0.12,
         "mr_rsi_long": 0.06,
         "mr_rsi_short": 0.05,
-        "bb_period": 0.06,         # Very tight — BB period changes hurt BTC
-        "trans_mult": 0.08,        # Tight — regime mults are hand-tuned
+        "bb_period": 0.06,
+        "trans_mult": 0.08,
         "sw_mult": 0.08,
         "mr_target_ext": 0.10,
         "bo_stop_atr": 0.12,
@@ -127,6 +130,21 @@ class AdaptiveParameterManager:
         "pyramid_thresh": 0.15,
         "pyramid_pct": 0.12,
     }
+
+    # Per-asset drift multiplier on MAX_DRIFT values.
+    # Well-tuned assets barely move; under-tuned assets explore more.
+    ASSET_DRIFT_SCALE = {
+        "BTC": 0.25,   # V14 hand-tuned, barely touch
+        "SOL": 0.30,   # V14 hand-tuned, barely touch
+        "ETH": 1.5,    # Under-tuned, more room to adapt
+        "LINK": 1.5,   # Under-tuned, more room to adapt
+    }
+
+    # Assets where hours should stay frozen (V14 hours are well-tuned)
+    FREEZE_HOURS_ASSETS = {"BTC", "SOL"}
+
+    # Assets where ALL recalibration is skipped (V14 params are optimal)
+    NO_ADAPT_ASSETS = {"BTC", "SOL"}
 
     # Dampening: blend new value with old (0.15 = 15% new, 85% old)
     BLEND_FACTOR = 0.15
@@ -204,6 +222,9 @@ class AdaptiveParameterManager:
         self._cached_lows = lows
 
     def should_recalibrate(self, bar):
+        # V15.1: skip all adaptation for well-tuned assets
+        if self.asset_name in self.NO_ADAPT_ASSETS:
+            return False
         if bar < self.WARMUP_BARS:
             return False
         return (bar - self._last_recalib_bar) >= self.RECALIB_INTERVAL
@@ -226,17 +247,19 @@ class AdaptiveParameterManager:
         self._recalib_pyramid(bar)
 
     def _set_param(self, bar, name, new_val):
-        """Set parameter with dampening and drift-bounded from V14 baseline."""
+        """Set parameter with dampening and drift-bounded from V14 baseline.
+        V15.1: drift bounds scaled per-asset."""
         old_val = self.params[name]
         # Blend new with old for stability (dampening)
         if isinstance(old_val, (int, float)) and isinstance(new_val, (int, float)):
             new_val = old_val * (1 - self.BLEND_FACTOR) + new_val * self.BLEND_FACTOR
-            # Enforce max drift from V14 baseline
+            # Enforce max drift from V14 baseline, scaled per-asset
             if name in self.MAX_DRIFT:
                 defaults = V14_DEFAULTS.get(self.asset_name, {})
                 if name in defaults:
                     baseline = defaults[name]
-                    drift = self.MAX_DRIFT[name]
+                    drift_scale = self.ASSET_DRIFT_SCALE.get(self.asset_name, 1.0)
+                    drift = self.MAX_DRIFT[name] * drift_scale
                     if isinstance(baseline, (int, float)) and baseline != 0:
                         lo = baseline * (1 - drift)
                         hi = baseline * (1 + drift)
@@ -412,6 +435,9 @@ class AdaptiveParameterManager:
 
     # --- 7. Good/bad hours ---
     def _recalib_hours(self, bar):
+        # V15.1: freeze hours for well-tuned assets
+        if self.asset_name in self.FREEZE_HOURS_ASSETS:
+            return
         total = sum(len(v) for v in self._hourly_pnl.values())
         if total < 30:
             return

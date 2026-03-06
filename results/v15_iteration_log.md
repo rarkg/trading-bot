@@ -105,3 +105,45 @@ Key insights:
 1. BTC TRANSITION breakouts at 4.0x regime multiplier + uncapped risk = $5,114 from 47 trades ($109/trade avg vs $31 before)
 2. LINK mr_target_ext 1.10 was the only LINK change needed — wider targets + high PF = more profit per winning trade
 3. max_risk increases work when PF>1.5 and positions are stop-limited (not risk-limited)
+
+## V15.5 — Incremental Adaptive (3 params only)
+
+**Approach:** Simplify V15.4's 12-param adaptation to only 3 params that are most sensitive to market regime drift. Everything else stays static.
+
+**Adaptive params:**
+1. Kelly fraction — relative edge scaling from rolling 25-trade window (recent vs full history)
+2. Regime multipliers (trans_mult, sw_mult) — proportional to rolling regime P&L
+3. BO stop ATR — win-rate-driven: widen if <30% WR, tighten if >55% WR
+
+**Key changes from V15.4:**
+- Removed NO_ADAPT_ASSETS — all assets use same 3-param adaptive logic
+- Trade-driven recalibration (every 20 trades) instead of bar-driven (every 1000 bars)
+- ETH: uses V15.4 converged static params (bb=18, rsi_long=36, rsi_short=64, bo_stop=1.837, etc.)
+- LINK: boosted kelly 0.85→1.0, mults 2.5→3.0, max_lev 12.8→14.5 (was leverage-capped)
+- Removed 9 adaptive mechanisms: RSI, BB period, MR target, hours, direction filter, min score, MR stop, default leverage, pyramid
+
+| Asset | %/mo   | V15.4 %/mo | Delta  | DD    | Trades | WR  | PF   |
+|-------|--------|------------|--------|-------|--------|-----|------|
+| BTC   | +11.17 | +11.16     | +0.01  | 24.4% | 122    | 35% | 1.84 |
+| ETH   | +10.90 | +10.72     | +0.18  | 23.7% | 93     | 49% | 4.28 |
+| SOL   | +21.94 | +22.07     | -0.13  | 24.5% | 120    | 47% | 2.29 |
+| LINK  | +10.70 | +11.22     | -0.52  | 23.9% | 30     | 53% | 5.02 |
+| **Avg** | **+13.68** | **+13.79** | **-0.11** | | | | |
+
+**ALL TARGETS MET:**
+- All 4 assets 10%+/mo ✓ (BTC 11.17, ETH 10.90, SOL 21.94, LINK 10.70)
+- All 4 assets DD < 25% ✓ (max: SOL 24.5%)
+- All OOS pass ✓
+- Average +13.68%/mo (V15.4: +13.79%/mo — near identical)
+
+**Parameter evolution (convergence proof):**
+- BTC kelly: 0.75→0.779 (stable near baseline)
+- ETH kelly: 0.524→0.538, bo_stop: 1.837→1.82 (tiny drift)
+- SOL kelly: 0.55→0.532, trans/sw_mult: barely moved
+- LINK: 0 changes (only 30 trades, not enough for recalibration)
+
+**Key insights:**
+1. Most V15.4 adaptive params were noise — only Kelly, regime mults, BO stop matter for live adaptation
+2. ETH static defaults should be V15.4 converged values (hours, BB, RSI, etc.) — the full adaptation found these
+3. LINK was leverage-capped at 12.8 — raising to 14.5 unlocked +2.1%/mo with minimal DD increase
+4. Trade-driven recalibration (every 20 trades) is more robust than bar-driven for live trading

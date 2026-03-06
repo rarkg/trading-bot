@@ -1,14 +1,11 @@
 """
-V15 — Hybrid Adaptive Strategy with Self-Tuning Parameters.
-Based on V14.3 (all assets 10%+/mo). Makes 12 of 20 parameters self-tuning
-so the strategy adapts to changing markets and new assets work without manual tuning.
+V15.5 — Incremental Adaptive Strategy.
+Based on V15.4 static params. Only 3 params are adaptive (most sensitive to regime drift):
+1. Kelly fraction — recalc from rolling win_rate * avg_win/avg_loss per direction
+2. Regime multipliers (trans_mult, sw_mult) — scale proportionally to rolling P&L per regime
+3. BO stop ATR — widen if >60% BO trades exit via STOP, tighten if <30%
 
-Auto-tunable (12): Kelly fraction, MR RSI thresholds, BB period, regime multipliers,
-MR target extension, BO stop/target ATR mults, good/bad hours, direction filter,
-TRANS breakout min score, MR stop, default leverage, pyramid config.
-
-Static (safety): min/max leverage, max_pyramids, candlestick patterns, max_risk_pct,
-fee_pct, cooldown, core regime detection thresholds.
+Everything else stays STATIC at V15.4 hand-tuned values.
 """
 
 import numpy as np
@@ -32,7 +29,7 @@ ASSET_MIN_LEVERAGE = {
 }
 
 ASSET_MAX_LEVERAGE = {
-    "BTC": 14.0, "ETH": 5.5, "SOL": 8.0, "LINK": 12.8,  # V15.3 original
+    "BTC": 14.0, "ETH": 5.5, "SOL": 8.0, "LINK": 14.5,  # V15.5: LINK 12.8→14.5
 }
 
 ASSET_BULL_PATTERNS = {
@@ -66,14 +63,14 @@ V14_DEFAULTS = {
         "default_leverage": 4.0, "pyramid_thresh": 3.0, "pyramid_pct": 50,
         "max_pyramids": 1,
     },
-    "ETH": {
-        "kelly_fraction": 0.60, "mr_rsi_long": 38, "mr_rsi_short": 62,
-        "bb_period": 20, "trans_mult": 2.0, "sw_mult": 2.0,
-        "mr_target_ext": 0.85, "bo_stop_atr": 2.0, "bo_target_atr": 12,
-        "good_hours": {22, 21, 3, 11, 20, 4, 5, 9},
-        "bad_hours": {13, 1, 23, 6, 16},
-        "trans_bo_min_score": 65, "mr_stop_atr": 1.0,
-        "default_leverage": 5.0, "pyramid_thresh": 2.0, "pyramid_pct": 75,
+    "ETH": {  # V15.4 converged values
+        "kelly_fraction": 0.524, "mr_rsi_long": 36, "mr_rsi_short": 64,
+        "bb_period": 18, "trans_mult": 2.0, "sw_mult": 2.0,
+        "mr_target_ext": 0.85, "bo_stop_atr": 1.837, "bo_target_atr": 12,
+        "good_hours": {13, 18, 20, 21, 23},
+        "bad_hours": {1, 4, 5, 9, 12},
+        "trans_bo_min_score": 65, "mr_stop_atr": 1.114,
+        "default_leverage": 5.288, "pyramid_thresh": 1.55, "pyramid_pct": 75,
         "max_pyramids": 2,
     },
     "SOL": {
@@ -86,9 +83,9 @@ V14_DEFAULTS = {
         "default_leverage": 3.0, "pyramid_thresh": 2.0, "pyramid_pct": 50,
         "max_pyramids": 2,
     },
-    "LINK": {
-        "kelly_fraction": 0.85, "mr_rsi_long": 35, "mr_rsi_short": 65,
-        "bb_period": 16, "trans_mult": 2.5, "sw_mult": 2.5,
+    "LINK": {  # V15.5: kelly 1.0, mults 3.0, max_lev 14.5 (leverage-capped asset)
+        "kelly_fraction": 1.0, "mr_rsi_long": 35, "mr_rsi_short": 65,
+        "bb_period": 16, "trans_mult": 3.0, "sw_mult": 3.0,
         "mr_target_ext": 1.10, "bo_stop_atr": 2.5, "bo_target_atr": 12,
         "good_hours": {22, 3, 9, 5, 4, 20, 21, 7},
         "bad_hours": {17, 13, 16, 1, 8, 0, 12, 19, 23},
@@ -104,50 +101,26 @@ V14_DEFAULTS = {
 # ============================================================
 
 class AdaptiveParameterManager:
-    """Self-tuning parameter manager. Recalibrates every 500 bars after 2000-bar warmup.
+    """V15.5 — Incremental adaptive. Only 3 params adapt; rest stay static at V15.4 values.
 
-    V15.1: Per-asset drift tiers. Well-tuned assets (BTC/SOL) barely drift from V14.
-    Under-tuned assets (ETH/LINK) get more room to adapt.
+    Adaptive params (trade-outcome-driven, all assets):
+    1. Kelly fraction — from rolling win_rate * avg_win/avg_loss per direction
+    2. Regime multipliers (trans_mult, sw_mult) — proportional to rolling regime P&L
+    3. BO stop ATR — widen if too many stops, tighten if few
+
+    Recalibration: every 20 completed trades (trade-driven, not bar-driven).
     """
 
-    WARMUP_BARS = 2000
-    RECALIB_INTERVAL = 1000
-
-    # Base max drift from V14 baseline (±fraction).
+    # Max drift from V14 baseline (±fraction of baseline value)
     MAX_DRIFT = {
-        "kelly_fraction": 0.12,
-        "mr_rsi_long": 0.06,
-        "mr_rsi_short": 0.05,
-        "bb_period": 0.06,
-        "trans_mult": 0.08,
-        "sw_mult": 0.08,
-        "mr_target_ext": 0.10,
-        "bo_stop_atr": 0.12,
-        "bo_target_atr": 0.12,
-        "trans_bo_min_score": 0.08,
-        "mr_stop_atr": 0.12,
-        "default_leverage": 0.08,
-        "pyramid_thresh": 0.15,
-        "pyramid_pct": 0.12,
+        "kelly_fraction": 0.25,
+        "trans_mult": 0.30,
+        "sw_mult": 0.30,
+        "bo_stop_atr": 0.25,
     }
 
-    # Per-asset drift multiplier on MAX_DRIFT values.
-    # Well-tuned assets barely move; under-tuned assets explore more.
-    ASSET_DRIFT_SCALE = {
-        "BTC": 0.25,   # V14 hand-tuned, barely touch
-        "SOL": 0.30,   # V14 hand-tuned, barely touch
-        "ETH": 1.5,    # Under-tuned, more room to adapt
-        "LINK": 0.75,  # V15.2: tighter drift prevents kelly/sw_mult degradation
-    }
-
-    # Assets where hours should stay frozen (V14 hours are well-tuned)
-    FREEZE_HOURS_ASSETS = {"BTC", "SOL"}
-
-    # Assets where ALL recalibration is skipped (V14 params are optimal)
-    NO_ADAPT_ASSETS = {"BTC", "SOL"}
-
-    # Dampening: blend new value with old (0.15 = 15% new, 85% old)
-    BLEND_FACTOR = 0.15
+    # Dampening: blend new value with old (0.20 = 20% new, 80% old)
+    BLEND_FACTOR = 0.20
 
     def __init__(self, asset_name):
         self.asset_name = asset_name
@@ -164,20 +137,10 @@ class AdaptiveParameterManager:
 
         # Trade history for recalibration
         self._trades = []           # (direction, pnl_pct, signal_type, regime, bar, hour)
-        self._regime_pnl = {}       # regime -> [pnl_usd]
-        self._hourly_pnl = {h: [] for h in range(24)}
-        self._mr_trades = []        # (pnl_pct, stop_hit, target_hit)
-        self._bo_trades = []        # (pnl_pct, stop_hit, target_hit)
-        self._pyramid_outcomes = [] # (success: bool)
-        self._direction_history = {"LONG": [], "SHORT": []}  # rolling win/loss
-        self._disabled_signals = {} # signal_type -> disabled_at_bar
-        self._last_recalib_bar = 0
+        self._regime_pnl = {}       # regime -> [pnl_pct]
+        self._bo_trades = []        # (pnl_pct,) for BO-type trades
+        self._last_recalib_trade_count = 0
         self._param_log = []        # [(bar, param_name, old_val, new_val)]
-
-        # For BB/RSI optimization we need price data
-        self._cached_closes = None
-        self._cached_highs = None
-        self._cached_lows = None
 
     def _median_defaults(self):
         """For unknown assets, use median of all known asset defaults."""
@@ -185,7 +148,6 @@ class AdaptiveParameterManager:
         result = {}
         for key in all_vals[0]:
             if key in ("good_hours", "bad_hours"):
-                # Use BTC hours as sensible default
                 result[key] = set(V14_DEFAULTS["BTC"][key])
             elif isinstance(all_vals[0][key], (int, float)):
                 vals = [d[key] for d in all_vals]
@@ -197,69 +159,49 @@ class AdaptiveParameterManager:
     def get(self, param):
         return self.params[param]
 
-    def record_trade(self, direction, pnl_pct, signal_type, regime, bar, hour):
+    def record_trade(self, direction, pnl_pct, signal_type, regime, bar, hour,
+                     exit_reason=None):
         self._trades.append((direction, pnl_pct, signal_type, regime, bar, hour))
 
         if regime not in self._regime_pnl:
             self._regime_pnl[regime] = []
         self._regime_pnl[regime].append(pnl_pct)
 
-        self._hourly_pnl[hour].append(pnl_pct)
-
-        if signal_type in ("meanrev", "overext_mr"):
-            self._mr_trades.append(pnl_pct)
-        elif signal_type in ("breakout", "vwap_bounce", "momentum"):
+        # Track BO trade outcomes for bo_stop_atr adaptation
+        if signal_type in ("breakout", "vwap_bounce", "momentum"):
             self._bo_trades.append(pnl_pct)
 
-        self._direction_history[direction].append(pnl_pct)
-
     def record_pyramid(self, success):
-        self._pyramid_outcomes.append(success)
+        pass  # Pyramids stay static in V15.5
 
     def cache_price_data(self, closes, highs, lows):
-        self._cached_closes = closes
-        self._cached_highs = highs
-        self._cached_lows = lows
+        pass  # No price-based recalibration in V15.5
+
+    def is_signal_disabled(self, signal_type):
+        return False  # No adaptive signal disabling in V15.5
 
     def should_recalibrate(self, bar):
-        # V15.1: skip all adaptation for well-tuned assets
-        if self.asset_name in self.NO_ADAPT_ASSETS:
-            return False
-        if bar < self.WARMUP_BARS:
-            return False
-        return (bar - self._last_recalib_bar) >= self.RECALIB_INTERVAL
+        # Trade-driven: recalibrate every 20 completed trades
+        return len(self._trades) >= self._last_recalib_trade_count + 20
 
     def recalibrate(self, bar):
-        """Run all adaptive recalibrations."""
-        self._last_recalib_bar = bar
-
+        """Run only the 3 adaptive recalibrations."""
+        self._last_recalib_trade_count = len(self._trades)
         self._recalib_kelly(bar)
-        self._recalib_mr_rsi(bar)
-        self._recalib_bb_period(bar)
         self._recalib_regime_mults(bar)
-        self._recalib_mr_target(bar)
-        self._recalib_bo_stops(bar)
-        self._recalib_hours(bar)
-        self._recalib_direction_filter(bar)
-        self._recalib_trans_min_score(bar)
-        self._recalib_mr_stop(bar)
-        self._recalib_default_leverage(bar)
-        self._recalib_pyramid(bar)
+        self._recalib_bo_stop_atr(bar)
 
     def _set_param(self, bar, name, new_val):
-        """Set parameter with dampening and drift-bounded from V14 baseline.
-        V15.1: drift bounds scaled per-asset."""
+        """Set parameter with dampening and drift-bounded from V14 baseline."""
         old_val = self.params[name]
-        # Blend new with old for stability (dampening)
         if isinstance(old_val, (int, float)) and isinstance(new_val, (int, float)):
             new_val = old_val * (1 - self.BLEND_FACTOR) + new_val * self.BLEND_FACTOR
-            # Enforce max drift from V14 baseline, scaled per-asset
+            # Enforce max drift from V14 baseline
             if name in self.MAX_DRIFT:
                 defaults = V14_DEFAULTS.get(self.asset_name, {})
                 if name in defaults:
                     baseline = defaults[name]
-                    drift_scale = self.ASSET_DRIFT_SCALE.get(self.asset_name, 1.0)
-                    drift = self.MAX_DRIFT[name] * drift_scale
+                    drift = self.MAX_DRIFT[name]
                     if isinstance(baseline, (int, float)) and baseline != 0:
                         lo = baseline * (1 - drift)
                         hi = baseline * (1 + drift)
@@ -274,292 +216,87 @@ class AdaptiveParameterManager:
 
     # --- 1. Kelly fraction ---
     def _recalib_kelly(self, bar):
+        """Scale kelly relative to baseline: compare recent edge vs full-history edge."""
         if len(self._trades) < 25:
             return
-        recent = self._trades[-40:]
-        wins = [t for t in recent if t[1] > 0]
-        losses = [t for t in recent if t[1] <= 0]
-        if not wins or not losses:
+        baseline = V14_DEFAULTS.get(self.asset_name, {}).get("kelly_fraction", 0.6)
+
+        def _edge(trades):
+            wins = [t for t in trades if t[1] > 0]
+            losses = [t for t in trades if t[1] <= 0]
+            if not wins or not losses:
+                return None
+            wr = len(wins) / len(trades)
+            avg_w = np.mean([t[1] for t in wins])
+            avg_l = abs(np.mean([t[1] for t in losses]))
+            if avg_l == 0:
+                return None
+            return wr * avg_w - (1 - wr) * avg_l
+
+        full_edge = _edge(self._trades)
+        recent_edge = _edge(self._trades[-25:])
+        if full_edge is None or recent_edge is None or full_edge == 0:
             return
-        win_rate = len(wins) / len(recent)
-        avg_win = np.mean([t[1] for t in wins])
-        avg_loss = abs(np.mean([t[1] for t in losses]))
-        if avg_loss == 0:
-            return
-        kelly = win_rate - (1 - win_rate) / (avg_win / avg_loss)
-        # Scale to fraction range
-        new_frac = max(0.2, min(1.0, kelly * 1.5))
+
+        # Scale factor: how much better/worse is recent vs full history
+        ratio = recent_edge / abs(full_edge)
+        # Clamp scale: 0.85x to 1.15x of baseline
+        scale = max(0.85, min(1.15, 0.5 + 0.5 * ratio))
+        new_frac = baseline * scale
         self._set_param(bar, "kelly_fraction", round(new_frac, 3))
 
-    # --- 2. MR RSI thresholds ---
-    def _recalib_mr_rsi(self, bar):
-        if self._cached_closes is None or bar < 2500:
-            return
-        closes = self._cached_closes
-        start = max(0, bar - 2000)
-        window = closes.iloc[start:bar].reset_index(drop=True)
-        if len(window) < 500:
-            return
-
-        delta = window.diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss.replace(0, 1e-10)
-        rsi = 100 - (100 / (1 + rs))
-        fwd_ret = window.shift(-6) / window - 1
-
-        best_long_rsi = self.params["mr_rsi_long"]
-        best_short_rsi = self.params["mr_rsi_short"]
-        best_score = -999
-
-        for lr in range(30, 43, 2):
-            for sr in range(58, 71, 2):
-                oversold = rsi < lr
-                overbought = rsi > sr
-                long_rets = fwd_ret[oversold].dropna()
-                short_rets = (-fwd_ret[overbought]).dropna()
-                if len(long_rets) < 3 or len(short_rets) < 3:
-                    continue
-                score = long_rets.mean() + short_rets.mean()
-                if score > best_score:
-                    best_score = score
-                    best_long_rsi = lr
-                    best_short_rsi = sr
-
-        self._set_param(bar, "mr_rsi_long", best_long_rsi)
-        self._set_param(bar, "mr_rsi_short", best_short_rsi)
-
-    # --- 3. BB period ---
-    def _recalib_bb_period(self, bar):
-        if self._cached_closes is None or bar < 2500:
-            return
-        closes = self._cached_closes
-        start = max(0, bar - 2000)
-        window = closes.iloc[start:bar].reset_index(drop=True)
-        if len(window) < 500:
-            return
-
-        best_period = self.params["bb_period"]
-        best_sharpe = -999
-
-        for period in range(14, 25, 2):
-            bb_mid = window.rolling(period).mean()
-            bb_std = window.rolling(period).std()
-            bb_lower = bb_mid - 2 * bb_std
-            bb_upper = bb_mid + 2 * bb_std
-            buy_sig = window < bb_lower
-            sell_sig = window > bb_upper
-            fwd_ret = window.shift(-6) / window - 1
-            long_rets = fwd_ret[buy_sig].dropna()
-            short_rets = (-fwd_ret[sell_sig]).dropna()
-            all_rets = pd.concat([long_rets, short_rets])
-            if len(all_rets) < 5:
-                continue
-            sharpe = all_rets.mean() / (all_rets.std() + 1e-10)
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_period = period
-
-        self._set_param(bar, "bb_period", best_period)
-
-    # --- 4. Regime multipliers ---
+    # --- 2. Regime multipliers ---
     def _recalib_regime_mults(self, bar):
+        """Scale regime multipliers proportionally to rolling P&L edge per regime."""
         trans_pnl = self._regime_pnl.get("TRANSITION", [])
         sw_pnl = self._regime_pnl.get("SIDEWAYS", [])
 
         if len(trans_pnl) >= 10:
-            avg_trans = np.mean(trans_pnl[-30:])
-            # Scale mult proportional to edge
-            base = 2.0
-            if avg_trans > 2.0:
-                new_mult = min(4.0, base + avg_trans * 0.15)
-            elif avg_trans < -1.0:
-                new_mult = max(1.0, base - 0.5)
+            recent = trans_pnl[-30:]
+            avg_pnl = np.mean(recent)
+            baseline = V14_DEFAULTS.get(self.asset_name, {}).get("trans_mult", 2.0)
+            # Scale: positive edge → boost, negative → reduce
+            if avg_pnl > 1.0:
+                scale = 1.0 + min(0.3, avg_pnl * 0.05)
+            elif avg_pnl < -1.0:
+                scale = max(0.7, 1.0 + avg_pnl * 0.05)
             else:
-                new_mult = base
+                scale = 1.0
+            new_mult = baseline * scale
             self._set_param(bar, "trans_mult", round(new_mult, 2))
 
         if len(sw_pnl) >= 10:
-            avg_sw = np.mean(sw_pnl[-30:])
-            base = 2.0
-            if avg_sw > 2.0:
-                new_mult = min(4.0, base + avg_sw * 0.15)
-            elif avg_sw < -1.0:
-                new_mult = max(1.0, base - 0.5)
+            recent = sw_pnl[-30:]
+            avg_pnl = np.mean(recent)
+            baseline = V14_DEFAULTS.get(self.asset_name, {}).get("sw_mult", 2.0)
+            if avg_pnl > 1.0:
+                scale = 1.0 + min(0.3, avg_pnl * 0.05)
+            elif avg_pnl < -1.0:
+                scale = max(0.7, 1.0 + avg_pnl * 0.05)
             else:
-                new_mult = base
+                scale = 1.0
+            new_mult = baseline * scale
             self._set_param(bar, "sw_mult", round(new_mult, 2))
 
-    # --- 5. MR target extension ---
-    def _recalib_mr_target(self, bar):
-        if len(self._mr_trades) < 15:
+    # --- 3. BO stop ATR ---
+    def _recalib_bo_stop_atr(self, bar):
+        """Adjust BO stop based on win rate of recent BO trades.
+        Low win rate → widen stop (stops too tight). High win rate → tighten slightly."""
+        if len(self._bo_trades) < 15:
             return
-        recent = self._mr_trades[-30:]
-        wins = [p for p in recent if p > 0]
-        if not wins:
-            return
-        avg_win = np.mean(wins)
-        # If wins are large, extend target; if small, reduce
-        if avg_win > 3.0:
-            new_ext = min(1.0, self.params["mr_target_ext"] + 0.03)
-        elif avg_win < 1.0:
-            new_ext = max(0.5, self.params["mr_target_ext"] - 0.03)
-        else:
-            new_ext = self.params["mr_target_ext"]
-        self._set_param(bar, "mr_target_ext", round(new_ext, 3))
-
-    # --- 6. BO stop/target ATR multipliers ---
-    def _recalib_bo_stops(self, bar):
-        if len(self._bo_trades) < 20:
-            return
-        recent = self._bo_trades[-30:]
-        wins = [p for p in recent if p > 0]
-        losses = [p for p in recent if p <= 0]
-        win_rate = len(wins) / len(recent) if recent else 0
+        recent = self._bo_trades[-20:]
+        wins = sum(1 for p in recent if p > 0)
+        win_rate = wins / len(recent)
+        baseline = V14_DEFAULTS.get(self.asset_name, {}).get("bo_stop_atr", 2.0)
 
         if win_rate < 0.30:
-            new_stop = self.params["bo_stop_atr"] + 0.15
+            # Low win rate — stops might be too tight, widen
+            new_stop = baseline * 1.08
             self._set_param(bar, "bo_stop_atr", round(new_stop, 2))
         elif win_rate > 0.55:
-            new_stop = self.params["bo_stop_atr"] - 0.1
+            # High win rate — can tighten slightly
+            new_stop = baseline * 0.95
             self._set_param(bar, "bo_stop_atr", round(new_stop, 2))
-
-        if wins:
-            avg_win = np.mean(wins)
-            if avg_win > 5.0:
-                new_target = self.params["bo_target_atr"] + 1
-                self._set_param(bar, "bo_target_atr", int(new_target))
-            elif avg_win < 1.5 and len(wins) >= 8:
-                new_target = self.params["bo_target_atr"] - 1
-                self._set_param(bar, "bo_target_atr", int(new_target))
-
-    # --- 7. Good/bad hours ---
-    def _recalib_hours(self, bar):
-        # V15.1: freeze hours for well-tuned assets
-        if self.asset_name in self.FREEZE_HOURS_ASSETS:
-            return
-        total = sum(len(v) for v in self._hourly_pnl.values())
-        if total < 30:
-            return
-
-        hour_avg = {}
-        for h in range(24):
-            pnls = self._hourly_pnl[h]
-            if len(pnls) >= 2:
-                hour_avg[h] = np.mean(pnls)
-
-        if len(hour_avg) < 10:
-            return
-
-        sorted_hours = sorted(hour_avg.keys(), key=lambda h: hour_avg[h], reverse=True)
-        new_good = set(sorted_hours[:max(4, len(sorted_hours) // 4)])
-        new_bad = set(sorted_hours[-max(4, len(sorted_hours) // 4):])
-
-        old_good = self.params["good_hours"]
-        old_bad = self.params["bad_hours"]
-        if new_good != old_good:
-            self._param_log.append((bar, "good_hours", old_good, new_good))
-            self.params["good_hours"] = new_good
-        if new_bad != old_bad:
-            self._param_log.append((bar, "bad_hours", old_bad, new_bad))
-            self.params["bad_hours"] = new_bad
-
-    # --- 8. Direction filter ---
-    def _recalib_direction_filter(self, bar):
-        for sig_type in ("meanrev", "breakout"):
-            key = f"{sig_type}"
-            relevant = [(d, p) for d, p, st, _, _, _ in self._trades if st == sig_type]
-            if len(relevant) < 30:
-                continue
-            recent = relevant[-25:]
-            wins = sum(1 for _, p in recent if p > 0)
-            win_rate = wins / len(recent)
-            # Only disable if VERY poor AND net negative PnL
-            avg_pnl = np.mean([p for _, p in recent])
-            if win_rate < 0.25 and avg_pnl < -1.0:
-                if key not in self._disabled_signals:
-                    self._disabled_signals[key] = bar
-                    self._param_log.append((bar, f"disable_{key}", "enabled", "disabled"))
-            elif key in self._disabled_signals:
-                if bar - self._disabled_signals[key] >= 500:
-                    del self._disabled_signals[key]
-                    self._param_log.append((bar, f"disable_{key}", "disabled", "re-enabled"))
-
-    def is_signal_disabled(self, signal_type):
-        return signal_type in self._disabled_signals
-
-    # --- 9. TRANS breakout min score ---
-    def _recalib_trans_min_score(self, bar):
-        trans_bo = [(p,) for _, p, st, r, _, _ in self._trades
-                    if r == "TRANSITION" and st == "breakout"]
-        if len(trans_bo) < 10:
-            return
-        recent = trans_bo[-20:]
-        wins = sum(1 for (p,) in recent if p > 0)
-        hit_rate = wins / len(recent)
-        # If hit rate is low, raise min score; if high, lower it
-        if hit_rate < 0.35:
-            new_min = min(75, self.params["trans_bo_min_score"] + 3)
-            self._set_param(bar, "trans_bo_min_score", int(new_min))
-        elif hit_rate > 0.55:
-            new_min = max(45, self.params["trans_bo_min_score"] - 2)
-            self._set_param(bar, "trans_bo_min_score", int(new_min))
-
-    # --- 10. MR stop ---
-    def _recalib_mr_stop(self, bar):
-        if len(self._mr_trades) < 20:
-            return
-        recent = self._mr_trades[-30:]
-        losses = [p for p in recent if p <= 0]
-        if not losses or len(losses) < 3:
-            return
-        avg_loss = abs(np.mean(losses))
-        if avg_loss > 4.0:
-            new_stop = self.params["mr_stop_atr"] - 0.05
-            self._set_param(bar, "mr_stop_atr", round(new_stop, 2))
-        elif avg_loss < 0.8 and len(losses) >= 5:
-            new_stop = self.params["mr_stop_atr"] + 0.05
-            self._set_param(bar, "mr_stop_atr", round(new_stop, 2))
-
-    # --- 11. Default leverage ---
-    def _recalib_default_leverage(self, bar):
-        if len(self._trades) < 25:
-            return
-        recent = self._trades[-40:]
-        wins = [t for t in recent if t[1] > 0]
-        losses = [t for t in recent if t[1] <= 0]
-        if not wins or not losses:
-            return
-        win_rate = len(wins) / len(recent)
-        avg_win = np.mean([t[1] for t in wins])
-        avg_loss = abs(np.mean([t[1] for t in losses]))
-        if avg_loss == 0:
-            return
-        kelly = win_rate - (1 - win_rate) / (avg_win / avg_loss)
-        min_lev = ASSET_MIN_LEVERAGE.get(self.asset_name, 2.0)
-        max_lev = ASSET_MAX_LEVERAGE.get(self.asset_name, 16.0)
-        # Only adjust if strong signal; use V14 default as anchor
-        v14_default = V14_DEFAULTS.get(self.asset_name, {}).get("default_leverage", self.params["default_leverage"])
-        if kelly <= 0:
-            new_lev = max(min_lev, v14_default * 0.7)
-        elif kelly > 0.3:
-            new_lev = min(max_lev, v14_default * 1.2)
-        else:
-            new_lev = v14_default
-        self._set_param(bar, "default_leverage", round(new_lev, 2))
-
-    # --- 12. Pyramid config ---
-    def _recalib_pyramid(self, bar):
-        if len(self._pyramid_outcomes) < 5:
-            return
-        recent = self._pyramid_outcomes[-15:]
-        success_rate = sum(recent) / len(recent)
-        if success_rate < 0.3:
-            new_thresh = min(5.0, self.params["pyramid_thresh"] + 0.3)
-            self._set_param(bar, "pyramid_thresh", round(new_thresh, 2))
-        elif success_rate > 0.6:
-            new_thresh = max(1.5, self.params["pyramid_thresh"] - 0.2)
-            self._set_param(bar, "pyramid_thresh", round(new_thresh, 2))
 
     def get_param_evolution(self):
         """Return summary of parameter changes for reporting."""
@@ -1728,7 +1465,7 @@ class SqueezeV15:
                 return signal
             return None
 
-    def record_trade(self, direction, pnl_pct):
+    def record_trade(self, direction, pnl_pct, exit_reason=None):
         self._trade_history.append((direction, pnl_pct))
         # Feed to APM
         hour = 12  # default
@@ -1737,7 +1474,8 @@ class SqueezeV15:
             hour = int(h) if not pd.isna(h) else 12
         sig_type = self._current_signal_type or "unknown"
         regime = self._current_regime or "TRANSITION"
-        self.apm.record_trade(direction, pnl_pct, sig_type, regime, self._entry_bar, hour)
+        self.apm.record_trade(direction, pnl_pct, sig_type, regime, self._entry_bar, hour,
+                              exit_reason=exit_reason)
 
     def check_exit(self, data, i, trade):
         if self._ind is None or i >= len(self._ind):

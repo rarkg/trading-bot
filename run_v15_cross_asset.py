@@ -1,12 +1,12 @@
 """
-V15 Cross-Asset Backtest — Hybrid Adaptive Strategy.
+V15.5 Cross-Asset Backtest — Incremental Adaptive Strategy.
 
-Tests V15 on all 4 assets with:
-- Per-asset results with adaptive parameters
+Tests V15.5 on all 4 assets with:
+- Per-asset results (3 adaptive params: Kelly, regime mults, BO stop ATR)
 - Regime breakdown
-- V14 vs V15 comparison
+- V14 vs V15.5 comparison
 - OOS validation (60/40 split)
-- Parameter evolution summary (which params changed most per asset)
+- Parameter evolution summary
 """
 
 import sys
@@ -125,7 +125,11 @@ class V15Engine(BacktestEngine):
                     trades.append(open_trade)
                     daily_pnls.append(pnl_pct)
 
-                    strategy.record_trade(open_trade.direction, open_trade.pnl_pct)
+                    if hasattr(strategy, 'apm'):
+                        strategy.record_trade(open_trade.direction, open_trade.pnl_pct,
+                                              exit_reason=exit_reason)
+                    else:
+                        strategy.record_trade(open_trade.direction, open_trade.pnl_pct)
                     open_trade = None
 
             if not open_trade:
@@ -179,7 +183,11 @@ class V15Engine(BacktestEngine):
             open_trade.pnl_usd = round(open_trade.size_usd * pnl_pct, 2)
             capital += open_trade.pnl_usd
             trades.append(open_trade)
-            strategy.record_trade(open_trade.direction, open_trade.pnl_pct)
+            if hasattr(strategy, 'apm'):
+                strategy.record_trade(open_trade.direction, open_trade.pnl_pct,
+                                      exit_reason="END_OF_DATA")
+            else:
+                strategy.record_trade(open_trade.direction, open_trade.pnl_pct)
 
         result = BacktestResult(
             strategy_name=name,
@@ -231,7 +239,7 @@ def main():
     total_bars = len(sample)
     date_range = f"{sample.index[0].date()} to {sample.index[-1].date()}"
 
-    ASSET_MAX_RISK = {"BTC": 150.0, "ETH": 30.0, "SOL": 8.0, "LINK": 25.0}  # V15.4: BTC 42→150, ETH 25→30, LINK 13→25
+    ASSET_MAX_RISK = {"BTC": 150.0, "ETH": 30.0, "SOL": 8.0, "LINK": 25.0}  # V15.5
 
     print("=" * 90)
     print("  V15 CROSS-ASSET BACKTEST — Hybrid Adaptive Strategy")

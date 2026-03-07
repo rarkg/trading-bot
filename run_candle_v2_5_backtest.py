@@ -163,7 +163,15 @@ def run_multi_asset(
                     _rs = regime_state
                     regime_adj = lambda d, rs=_rs: regime_detector.get_score_adjustment(rs, d)
 
-                sig = strat.generate_signal(df, idx, regime_score_adj=regime_adj)
+                sig = strat.generate_signal(df, idx)
+
+                # Apply regime score adjustment if enabled
+                if sig and sig.get("action") in ("LONG", "SHORT") and regime_adj is not None:
+                    original_score = sig.get("score", 0)
+                    score_adjustment = regime_adj(sig["action"])
+                    # Apply as multiplier (typical for regime adjustments)
+                    sig["score"] = original_score * score_adjustment
+
                 if sig and sig.get("action") in ("LONG", "SHORT"):
                     direction = sig["action"]
                     stop = sig["stop"]

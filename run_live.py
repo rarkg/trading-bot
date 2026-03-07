@@ -636,6 +636,14 @@ class LiveRunner:
             price, stop, target, size_usd, leverage,
         )
 
+        # Log as PENDING before placing order
+        trade_id = None  # type: Optional[int]
+        if self.bot_id is not None:
+            trade_id = self.pg.log_trade_open(
+                self.bot_id, asset, strat_name, direction, signal_name,
+                price, stop, target, size_usd, leverage,
+            )
+
         try:
             order = self.executor.place_order(
                 symbol=asset,
@@ -646,17 +654,33 @@ class LiveRunner:
             order_id = order.get("id", "")
         except Exception:
             log.exception("Failed to place %s %s order", asset, strat_name)
-            if self.bot_id is not None:
+            # Mark PENDING trade as FAILED
+            if trade_id and self.bot_id is not None:
+                self.pg.cancel_pending_trade(trade_id, f"Order placement failed: {signal_name}")
                 self.pg.log_decision(self.bot_id, asset, strat_name, "ERROR", f"Order failed for {signal_name}")
             return
 
-        # Track position in Postgres
-        trade_id = None  # type: Optional[int]
-        if self.bot_id is not None:
-            trade_id = self.pg.log_trade_open(
-                self.bot_id, asset, strat_name, direction, signal_name,
-                price, stop, target, size_usd, leverage,
-            )
+        # Confirm fill — get actual fill price from exchange
+        actual_fill = price  # fallback
+        try:
+            import time as _time
+            _time.sleep(0.5)  # brief wait for fill
+            order_status = self.executor.exchange.fetch_order(order_id, CCXT_SYMBOLS.get(asset, asset + "/USD:USD"))
+            if order_status.get("status") == "closed":
+                actual_fill = float(order_status.get("average") or order_status.get("price") or price)
+                log.info("Fill confirmed: %s %s @ $%.4f (signal price $%.4f)", asset, direction, actual_fill, price)
+            elif order_status.get("status") == "canceled":
+                if trade_id and self.bot_id:
+                    self.pg.cancel_pending_trade(trade_id, "Order cancelled by exchange")
+                log.warning("Order cancelled by exchange for %s %s", asset, strat_name)
+                return
+        except Exception:
+            log.warning("Could not confirm fill for %s — using signal price", asset)
+
+        # Confirm trade as OPEN with actual fill price
+        if trade_id:
+            self.pg.confirm_trade_open(trade_id, actual_fill)
+            trade.entry_price = actual_fill  # update trade with real fill
 
         pos = LivePosition(
             trade_id=trade_id,

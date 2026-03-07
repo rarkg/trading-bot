@@ -86,6 +86,34 @@ class PgWriter:
             log.warning("Failed to register bot in Postgres", exc_info=True)
             return None
 
+    def confirm_trade_open(self, pg_trade_id: int, actual_fill_price: float) -> None:
+        """Confirm a PENDING trade is now OPEN with the actual fill price."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE bot_trades
+                       SET status='OPEN', entry_price=%s
+                       WHERE id=%s AND status='PENDING'""",
+                    (float(actual_fill_price), pg_trade_id),
+                )
+                self.conn.commit()
+        except Exception:
+            log.warning("Failed to confirm trade open in Postgres", exc_info=True)
+
+    def cancel_pending_trade(self, pg_trade_id: int, reason: str) -> None:
+        """Mark a PENDING trade as FAILED (order rejected/not filled)."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE bot_trades
+                       SET status='FAILED', exit_reason=%s, closed_at=%s
+                       WHERE id=%s AND status='PENDING'""",
+                    (reason, datetime.now(timezone.utc), pg_trade_id),
+                )
+                self.conn.commit()
+        except Exception:
+            log.warning("Failed to cancel pending trade in Postgres", exc_info=True)
+
     def log_trade_open(
         self,
         bot_id: int,
@@ -109,13 +137,13 @@ class PgWriter:
                        (bot_id, asset, strategy, direction, signal,
                         entry_price, stop_price, target_price, size_usd,
                         leverage, status, opened_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        RETURNING id""",
                     (
                         bot_id, asset, strategy, direction, signal,
                         float(entry_price), float(stop_price) if stop_price is not None else None,
                         float(target_price) if target_price is not None else None,
-                        float(size_usd), float(leverage), datetime.now(timezone.utc),
+                        float(size_usd), float(leverage), 'PENDING', datetime.now(timezone.utc),
                     ),
                 )
                 row = cur.fetchone()

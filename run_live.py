@@ -416,17 +416,22 @@ class LiveRunner:
                 slot_equity = CAPITAL_PER_ASSET + unrealized
                 self.pg.log_equity(self.bot_id, asset, slot_equity, unrealized, open_count)
 
-        # Heartbeat — total equity = initial capital + all unrealized PnL
+        # Heartbeat — fetch real balance from Kraken as source of truth
         if self.bot_id is not None:
-            total_equity = CAPITAL_PER_ASSET * len(ASSETS)
-            for pos in self.positions.values():
-                df_cache = self.candle_cache.get(pos.asset)
-                price_now = float(df_cache.iloc[-1]["close"]) if df_cache is not None and len(df_cache) > 0 else 0.0
-                if price_now > 0:
-                    if pos.trade.direction == "LONG":
-                        total_equity += (price_now - pos.trade.entry_price) / pos.trade.entry_price * pos.trade.size_usd
-                    else:
-                        total_equity += (pos.trade.entry_price - price_now) / pos.trade.entry_price * pos.trade.size_usd
+            try:
+                balance = self.executor.exchange.fetch_balance()
+                total_equity = float(balance.get("total", {}).get("USD", 0) or 0)
+                unrealized = sum(
+                    float(p.get("unrealizedPnl") or 0)
+                    for p in self.executor.get_positions()
+                )
+                realized_pnl = total_equity - config.INITIAL_CAPITAL
+                log.info("Account equity: $%.2f (started $%.0f, PnL $%+.2f)", total_equity, config.INITIAL_CAPITAL, realized_pnl)
+                # Log as ACCOUNT row in bot_equity for dashboard
+                self.pg.log_equity(self.bot_id, "ACCOUNT", total_equity, realized_pnl, len(self.positions))
+            except Exception:
+                log.warning("Failed to fetch Kraken balance for heartbeat", exc_info=True)
+                total_equity = config.INITIAL_CAPITAL
             self.pg.log_heartbeat(
                 self.bot_id, self._tick_signals,
                 self._tick_opened, self._tick_closed, total_equity,

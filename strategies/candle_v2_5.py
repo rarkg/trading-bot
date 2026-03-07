@@ -822,10 +822,12 @@ class CandleV2_5:
             target = price - atr * self.target_atr
 
         lev = self.base_leverage
-        if best_score >= 4:
-            lev *= 1.3
+        if best_score >= 5:
+            lev *= 3.5   # 2x → 7x
+        elif best_score >= 4:
+            lev *= 2.5   # 2x → 5x
         elif best_score >= 3:
-            lev *= 1.15
+            lev *= 1.5   # 2x → 3x
 
         self._bars_in_trade = 0
 

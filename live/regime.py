@@ -1,5 +1,5 @@
 """
-Regime Detection — V2.5
+Regime Detection — V2.6
 
 Classifies market regime per asset using:
   - EMA slope (50-period, normalized by ATR)
@@ -8,6 +8,13 @@ Classifies market regime per asset using:
 
 Three regimes: TRENDING_UP, TRENDING_DOWN, RANGING.
 Volatility overlay adjusts sizing independently.
+
+V2.6 additions:
+  - regime_size_multiplier(): combined ADX + EMA slope sizing factor
+    - Trending aligned: 1.2x
+    - Ranging: 0.8x
+    - Volatile (high ATR): 0.7x
+    - Bounds: 0.5x - 1.5x
 """
 
 import numpy as np
@@ -18,25 +25,64 @@ from typing import Optional
 class RegimeState:
     """Result of regime detection for one asset at one point in time."""
 
-    __slots__ = ("regime", "volatility_multiplier", "_direction_mults")
+    __slots__ = ("regime", "volatility_multiplier", "_direction_mults",
+                 "adx_val", "ema_slope", "atr_percentile")
 
     def __init__(self, regime: str, vol_mult: float,
-                 long_mult: float, short_mult: float):
+                 long_mult: float, short_mult: float,
+                 adx_val: float = 0.0, ema_slope: float = 0.0,
+                 atr_percentile: float = 50.0):
         self.regime = regime                  # "TRENDING_UP", "TRENDING_DOWN", "RANGING"
         self.volatility_multiplier = vol_mult # 0.8 - 1.0
         self._direction_mults = {"LONG": long_mult, "SHORT": short_mult}
+        self.adx_val = adx_val
+        self.ema_slope = ema_slope
+        self.atr_percentile = atr_percentile
 
     def direction_multiplier(self, direction: str) -> float:
         """Get sizing multiplier for a given trade direction."""
         return self._direction_mults.get(direction, 1.0)
 
+    def regime_size_multiplier(self, direction: str) -> float:
+        """V2.6: Combined ADX + EMA slope position size multiplier.
+
+        - Trending aligned (ADX > 25, slope agrees with direction): 1.2x
+        - Ranging (ADX < 20): 0.8x
+        - Volatile (ATR pct > 80): 0.7x
+        - Bounds: [0.5, 1.5]
+        """
+        mult = 1.0
+
+        # Trending aligned boost
+        if self.adx_val > 25:
+            if (direction == "LONG" and self.ema_slope > 0.3) or \
+               (direction == "SHORT" and self.ema_slope < -0.3):
+                mult = 1.2
+            elif (direction == "LONG" and self.ema_slope < -0.3) or \
+                 (direction == "SHORT" and self.ema_slope > 0.3):
+                # Counter-trend in strong trend — reduce
+                mult = 0.7
+
+        # Ranging reduction
+        if self.adx_val < 20:
+            mult = min(mult, 0.8)
+
+        # High volatility reduction
+        if self.atr_percentile > 80:
+            mult *= 0.7 / mult if mult > 0.7 else 1.0
+            mult = min(mult, 0.7)
+
+        # Clamp to bounds
+        return max(0.5, min(1.5, mult))
+
     def __repr__(self) -> str:
         return (f"RegimeState({self.regime}, vol={self.volatility_multiplier:.2f}, "
-                f"L={self._direction_mults['LONG']:.2f}, S={self._direction_mults['SHORT']:.2f})")
+                f"L={self._direction_mults['LONG']:.2f}, S={self._direction_mults['SHORT']:.2f}, "
+                f"adx={self.adx_val:.1f}, slope={self.ema_slope:.2f})")
 
 
 # Default (neutral) state — used when not enough data
-_NEUTRAL = RegimeState("NEUTRAL", 1.0, 1.0, 1.0)
+_NEUTRAL = RegimeState("NEUTRAL", 1.0, 1.0, 1.0, adx_val=0.0, ema_slope=0.0, atr_percentile=50.0)
 
 
 class RegimeDetector:
@@ -103,13 +149,17 @@ class RegimeDetector:
         adx = talib.ADX(h, l, c, timeperiod=14)
         adx_val = adx[i] if not np.isnan(adx[i]) else 0.0
 
+        # --- ATR percentile ---
+        atr_pct = self._atr_percentile(atr14, i)
+
         # --- Classify regime ---
         regime, long_mult, short_mult = self._classify(slope, adx_val)
 
         # --- Volatility overlay ---
         vol_mult = self._volatility_overlay(atr14, i)
 
-        return RegimeState(regime, vol_mult, long_mult, short_mult)
+        return RegimeState(regime, vol_mult, long_mult, short_mult,
+                           adx_val=adx_val, ema_slope=slope, atr_percentile=atr_pct)
 
     def _classify(self, slope: float, adx: float):
         """Classify regime and return (regime_name, long_mult, short_mult)."""
@@ -127,6 +177,15 @@ class RegimeDetector:
 
         # Default: neutral (between thresholds)
         return ("NEUTRAL", 1.0, 1.0)
+
+    def _atr_percentile(self, atr: np.ndarray, i: int) -> float:
+        """Compute ATR percentile (0-100) for current bar."""
+        start = max(0, i - self.VOL_LOOKBACK)
+        window = atr[start:i]
+        window = window[~np.isnan(window)]
+        if len(window) < 20:
+            return 50.0
+        return float(np.sum(window <= atr[i]) / len(window) * 100)
 
     def _volatility_overlay(self, atr: np.ndarray, i: int) -> float:
         """Compute volatility multiplier based on ATR percentile."""

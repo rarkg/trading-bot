@@ -28,6 +28,15 @@ MAX_DRAWDOWN = 0.25  # 25% per asset — halt trading if breached
 # Environment
 DEMO = True  # Set False for live trading
 
+# ─── V2.6 Feature Flags ───
+USE_WICK_GUARD = True          # Wick-resistant stops: require 15m close below SL
+USE_SMART_ENTRIES = True       # Limit orders at pullback (entry - 0.3*ATR)
+USE_REGIME_SIZING = True       # ADX+EMA slope position size multiplier
+SMART_ENTRY_PULLBACK_ATR = 0.3 # Pullback distance as fraction of ATR
+SMART_ENTRY_EXPIRY_HOURS = 1   # Cancel unfilled limit orders after N hours
+REGIME_SIZE_MIN = 0.5          # Min regime sizing multiplier
+REGIME_SIZE_MAX = 1.5          # Max regime sizing multiplier
+
 # ─── Config 2 (Candle V2.3) ───
 # R:R 3:2 — stop 3 ATR, target 2 ATR
 CANDLE_V2_CONFIG = {

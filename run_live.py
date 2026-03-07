@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -33,6 +34,8 @@ from live import config
 from live.exchange.kraken import CCXT_SYMBOLS
 from live.adaptive_sizer import AdaptiveSizer
 from live.regime import RegimeDetector
+from live.wick_guard import WickGuard
+from live.entry_optimizer import EntryOptimizer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -83,6 +86,37 @@ def send_imsg(message: str) -> None:
         )
     except Exception:
         log.warning("Failed to send iMessage alert", exc_info=True)
+
+
+# Error tracking for rate-limiting alerts
+_error_counts: dict = {}  # type: dict[str, int]
+_last_alert_time: dict = {}  # type: dict[str, float]
+ALERT_COOLDOWN_SEC = 300  # Don't spam same error more than once per 5 min
+
+
+def alert_error(category: str, message: str) -> None:
+    """Send error alert to OpenClaw (Elio) for auto-fix. Rate-limited per category."""
+    import time as _time
+    now = _time.time()
+    _error_counts[category] = _error_counts.get(category, 0) + 1
+    last = _last_alert_time.get(category, 0)
+    if now - last < ALERT_COOLDOWN_SEC:
+        return  # Rate limited
+    _last_alert_time[category] = now
+    count = _error_counts[category]
+    alert_text = f"crypto-live ERROR [{category}] (x{count}): {message}"
+    log.error(alert_text)
+    try:
+        subprocess.run(
+            ["openclaw", "system-event", "--text", alert_text, "--mode", "now"],
+            timeout=10,
+            capture_output=True,
+        )
+    except Exception:
+        log.warning("Failed to send error alert to OpenClaw")
+    # Also iMessage Dan on critical errors
+    if count >= 3 or category in ("CRASH", "EXCHANGE_DOWN", "DB_DOWN"):
+        send_imsg(f"⚠️ Bot error: {category} - {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +212,17 @@ class LiveRunner:
             enabled=getattr(config, "USE_REGIME_DETECTION", False),
         )
 
+        # V2.6: Wick guard, smart entries, regime sizing
+        self.wick_guard = WickGuard(
+            enabled=getattr(config, "USE_WICK_GUARD", False),
+        )
+        self.entry_optimizer = EntryOptimizer(
+            enabled=getattr(config, "USE_SMART_ENTRIES", False),
+            pullback_atr=getattr(config, "SMART_ENTRY_PULLBACK_ATR", 0.3),
+            expiry_hours=getattr(config, "SMART_ENTRY_EXPIRY_HOURS", 1),
+        )
+        self.use_regime_sizing = getattr(config, "USE_REGIME_SIZING", False)
+
         # Open positions: key = (asset, strategy_name)
         self.positions: dict[tuple[str, str], LivePosition] = {}
 
@@ -208,6 +253,9 @@ class LiveRunner:
         # Initial data load — get enough history for indicators
         self._load_initial_data()
 
+        # V2.6: Re-evaluate existing positions against new strategy params
+        self._reevaluate_positions()
+
         # Wire BTC data to squeeze strategies for cross-asset features
         if "BTC" in self.candle_cache:
             for asset, strat in self.squeeze.items():
@@ -222,8 +270,9 @@ class LiveRunner:
                 self._fast_check()
                 # Hourly: full candle analysis + signal generation
                 self._tick()
-            except Exception:
+            except Exception as e:
                 log.exception("Error in main loop tick")
+                alert_error("MAIN_LOOP", str(e)[:200])
             time.sleep(LOOP_INTERVAL_SEC)
 
         log.info("=== Shutdown complete ===")
@@ -237,8 +286,9 @@ class LiveRunner:
         """Reconcile Postgres positions with Kraken on startup."""
         try:
             exchange_positions = self.executor.get_positions()
-        except Exception:
+        except Exception as e:
             log.exception("Failed to fetch exchange positions for sync")
+            alert_error("EXCHANGE_DOWN", f"Cannot fetch positions: {str(e)[:150]}")
             return
 
         # Build map of exchange positions: ccxt_symbol -> pos dict
@@ -375,6 +425,86 @@ class LiveRunner:
                     log.warning("  %s: no candles returned", asset)
             except Exception:
                 log.exception("  %s: failed to load candles", asset)
+                alert_error("CANDLE_FEED", f"{asset}: failed to load candles")
+
+    def _reevaluate_positions(self):
+        """V2.6: Re-evaluate all open positions against current strategy params.
+
+        When new config is deployed, existing positions may have stale SL/TP/targets.
+        This method recalculates them using current strategy parameters and ATR,
+        then updates the exchange orders accordingly.
+        """
+        if not self.positions:
+            log.info("REEVAL: No open positions to re-evaluate")
+            return
+
+        log.info("REEVAL: Re-evaluating %d open positions against V2.6 params...", len(self.positions))
+
+        for key, pos in list(self.positions.items()):
+            asset = pos.asset
+            if asset not in self.candle_cache:
+                continue
+
+            df = self.candle_cache[asset]
+            if len(df) < MIN_BARS:
+                continue
+
+            i = len(df) - 1
+            strat = self.candle.get(asset)
+            if strat is None:
+                continue
+
+            # Recompute indicators to get current ATR
+            strat._compute_indicators(df, i)
+            atr = strat._indicators["atr"][i]
+            if np.isnan(atr) or atr <= 0:
+                continue
+
+            trade = pos.trade
+            price = float(df.iloc[i]["close"])
+
+            # Recalculate stop and target from current price using strategy params
+            old_stop = trade.stop_price
+            old_target = trade.target_price
+
+            if trade.direction == "LONG":
+                new_stop = trade.entry_price - atr * strat.stop_atr
+                new_target = trade.entry_price + atr * strat.target_atr
+                # Only tighten stops, never widen (protect existing gains)
+                if old_stop > 0 and new_stop < old_stop:
+                    new_stop = old_stop
+            else:
+                new_stop = trade.entry_price + atr * strat.stop_atr
+                new_target = trade.entry_price - atr * strat.target_atr
+                if old_stop > 0 and new_stop > old_stop:
+                    new_stop = old_stop
+
+            changed = False
+            if abs(new_stop - old_stop) > atr * 0.01:
+                trade.stop_price = new_stop
+                changed = True
+            if abs(new_target - old_target) > atr * 0.01:
+                trade.target_price = new_target
+                changed = True
+
+            if changed:
+                log.info(
+                    "REEVAL: %s %s %s | stop %.2f->%.2f | target %.2f->%.2f",
+                    asset, pos.strategy, trade.direction,
+                    old_stop, trade.stop_price,
+                    old_target, trade.target_price,
+                )
+                # Cancel old exchange SL/TP and place new ones
+                self._cancel_sl_tp(pos)
+                self._place_sl_tp(pos)
+
+                # Update Postgres
+                if pos.trade_id is not None:
+                    self.pg.update_trade_levels(
+                        pos.trade_id, trade.stop_price, trade.target_price
+                    )
+            else:
+                log.info("REEVAL: %s %s — no change needed", asset, pos.strategy)
 
     def _fast_check(self):
         """Fast price check every minute — trailing stop, SL/TP, exchange reconciliation."""
@@ -410,18 +540,29 @@ class LiveRunner:
                 # Check strategy exit (handles trailing stop logic)
                 strat = self.candle.get(asset)
                 if strat:
-                    # Build a minimal check using current price
                     exit_reason = None
+
+                    # V2.6: TP executes immediately on tick
                     if trade.direction == "LONG":
-                        if price <= trade.stop_price:
-                            exit_reason = "STOP"
-                        elif trade.target_price > 0 and price >= trade.target_price:
+                        if trade.target_price > 0 and price >= trade.target_price:
                             exit_reason = "TARGET"
                     else:
-                        if price >= trade.stop_price:
-                            exit_reason = "STOP"
-                        elif trade.target_price > 0 and price <= trade.target_price:
+                        if trade.target_price > 0 and price <= trade.target_price:
                             exit_reason = "TARGET"
+
+                    # V2.6: Wick-resistant stop — require 15m close beyond stop
+                    if exit_reason is None:
+                        pos_key_str = f"{asset}_{pos.strategy}"
+                        if trade.direction == "LONG" and price <= trade.stop_price:
+                            if self.wick_guard.should_trigger_stop(
+                                pos_key_str, trade.direction, trade.stop_price, price
+                            ):
+                                exit_reason = "STOP"
+                        elif trade.direction == "SHORT" and price >= trade.stop_price:
+                            if self.wick_guard.should_trigger_stop(
+                                pos_key_str, trade.direction, trade.stop_price, price
+                            ):
+                                exit_reason = "STOP"
 
                     # Dust check — close tiny positions not worth keeping
                     if trade.size_usd and trade.size_usd < DUST_THRESHOLD_USD:
@@ -432,9 +573,53 @@ class LiveRunner:
                                  asset, trade.direction, pos.strategy, exit_reason, price)
                         self._close_position(key, pos, price, exit_reason)
                         keys_to_close.append(key)
+                        self.wick_guard.clear(f"{asset}_{pos.strategy}")
 
             for k in keys_to_close:
                 del self.positions[k]
+
+        # V2.6: Check pending limit entries for fills
+        if self.entry_optimizer.enabled:
+            now = datetime.now(timezone.utc)
+            # Expire old entries first
+            expired = self.entry_optimizer.expire_all(now)
+            for exp in expired:
+                log.info("SMART_ENTRY: %s %s limit expired (unfilled)", exp.asset, exp.direction)
+                # Cancel exchange limit order if placed
+                if exp.order_id:
+                    try:
+                        self.executor.cancel_order(exp.order_id, exp.asset)
+                    except Exception:
+                        pass
+
+            # Check fills for remaining pending entries
+            for asset in ASSETS:
+                for strat_name in ["candle_v2_3"]:
+                    key = (asset, strat_name)
+                    if key in self.positions:
+                        continue
+                    try:
+                        ticker = self.executor.client.exchange.fetch_ticker(
+                            CCXT_SYMBOLS.get(asset.upper(), "BTC/USD:USD")
+                        )
+                        price = ticker.get("last", 0.0)
+                        high = ticker.get("high", price)
+                        low = ticker.get("low", price)
+                        if price <= 0:
+                            continue
+                    except Exception:
+                        continue
+
+                    filled = self.entry_optimizer.check_fill(
+                        asset, strat_name, high, low, now
+                    )
+                    if filled:
+                        log.info("SMART_ENTRY: %s %s filled at limit $%.4f",
+                                 asset, filled.direction, filled.limit_price)
+                        self._execute_entry(
+                            asset, strat_name, filled.signal,
+                            filled.limit_price, filled.direction,
+                        )
 
     def _tick(self):
         """Hourly iteration: fetch new candle, run strategies, manage positions."""
@@ -458,6 +643,7 @@ class LiveRunner:
                     self.candle_cache[asset] = df
             except Exception:
                 log.exception("Failed to fetch %s candles", asset)
+                alert_error("CANDLE_FEED", f"{asset}: failed to fetch candles")
 
         # Wire BTC data for cross-asset
         if "BTC" in self.candle_cache:
@@ -595,6 +781,7 @@ class LiveRunner:
             )
         except Exception:
             log.exception("Failed to close %s %s position on exchange", pos.asset, pos.strategy)
+            alert_error("ORDER_FAIL", f"Failed to close {pos.asset} {pos.strategy}")
 
         # Postgres
         if pos.trade_id is not None:
@@ -723,6 +910,12 @@ class LiveRunner:
         regime_dir_mult = regime_state.direction_multiplier(direction)
         vol_mult = regime_state.volatility_multiplier
         combined_mult = adaptive_mult * regime_dir_mult * vol_mult
+
+        # V2.6: Regime sizing multiplier
+        if self.use_regime_sizing:
+            regime_size_mult = regime_state.regime_size_multiplier(direction)
+            combined_mult *= regime_size_mult
+
         # Clamp total multiplier: 0.2x - 2.5x
         combined_mult = max(0.2, min(2.5, combined_mult))
         adjusted_capital = base_capital * combined_mult
@@ -733,10 +926,75 @@ class LiveRunner:
                 self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", f"Size=0 for {signal_name}")
             return
 
-        # Create trade object
+        # V2.6: Smart entries — place limit order at pullback instead of market
+        if self.entry_optimizer.enabled:
+            atr_val = sig.get("atr_at_entry", 0)
+            if atr_val and atr_val > 0:
+                limit_price = self.entry_optimizer.compute_limit_price(direction, price, atr_val)
+                sig["_size_usd"] = size_usd
+                sig["_leverage"] = leverage
+                sig["_stop"] = stop
+                sig["_target"] = target
+                sig["_signal_name"] = signal_name
+                sig["_regime_mult"] = combined_mult
+
+                pending = self.entry_optimizer.create_pending(
+                    asset, strat_name, direction, limit_price, sig
+                )
+
+                # Place limit order on exchange
+                order_side = "buy" if direction == "LONG" else "sell"
+                size_contracts = size_usd / limit_price if limit_price > 0 else 0
+                try:
+                    order = self.executor.place_limit_order(
+                        symbol=asset,
+                        side=order_side,
+                        size=size_contracts,
+                        price=limit_price,
+                    )
+                    pending.order_id = order.get("id", "")
+                    log.info(
+                        "SMART_ENTRY: %s %s %s limit @ $%.4f (pullback from $%.4f)",
+                        asset, direction, strat_name, limit_price, price,
+                    )
+                except Exception:
+                    log.exception("Failed to place limit order for %s", asset)
+                    self.entry_optimizer.cancel_pending(asset, strat_name)
+
+                if self.bot_id is not None:
+                    self.pg.log_decision(
+                        self.bot_id, asset, strat_name, "LIMIT",
+                        f"{signal_name} limit=${limit_price:.2f}",
+                    )
+                return
+
+        # Market order entry (fallback or when smart entries disabled)
+        self._execute_entry(asset, strat_name, sig, price, direction)
+
+    def _execute_entry(
+        self, asset: str, strat_name: str, sig: dict,
+        entry_price: float, direction: str,
+    ):
+        """Execute an entry (market or filled limit) — shared by _run_strategy and smart entry fill."""
+        key = (asset, strat_name)
+        if key in self.positions:
+            return
+
+        stop = sig.get("_stop", sig.get("stop", 0))
+        target = sig.get("_target", sig.get("target", 0))
+        leverage = sig.get("_leverage", sig.get("leverage", 1.0))
+        signal_name = sig.get("_signal_name", sig.get("signal", strat_name))
+        size_usd = sig.get("_size_usd", 0)
+
+        # If no pre-computed size, compute now
+        if size_usd <= 0:
+            size_usd = size_position(sig, entry_price, self.risk_mgr, CAPITAL_PER_ASSET)
+        if size_usd <= 0:
+            return
+
         trade = Trade(
-            entry_time=df.index[i],
-            entry_price=price,
+            entry_time=pd.Timestamp.now(tz="UTC"),
+            entry_price=entry_price,
             direction=direction,
             signal=signal_name,
             stop_price=stop,
@@ -745,14 +1003,13 @@ class LiveRunner:
             leverage=leverage,
         )
 
-        # Execute on exchange
         order_side = "buy" if direction == "LONG" else "sell"
-        size_contracts = size_usd / price if price > 0 else 0
+        size_contracts = size_usd / entry_price if entry_price > 0 else 0
 
         log.info(
             "OPEN %s %s %s | signal=%s price=%.2f stop=%.2f target=%.2f size=$%.0f lev=%.1fx",
             asset, strat_name, direction, signal_name,
-            price, stop, target, size_usd, leverage,
+            entry_price, stop, target, size_usd, leverage,
         )
 
         try:
@@ -765,16 +1022,16 @@ class LiveRunner:
             order_id = order.get("id", "")
         except Exception:
             log.exception("Failed to place %s %s order", asset, strat_name)
+            alert_error("ORDER_FAIL", f"Failed to place {asset} {strat_name} order")
             if self.bot_id is not None:
                 self.pg.log_decision(self.bot_id, asset, strat_name, "ERROR", f"Order failed for {signal_name}")
             return
 
-        # Track position in Postgres
         trade_id = None  # type: Optional[int]
         if self.bot_id is not None:
             trade_id = self.pg.log_trade_open(
                 self.bot_id, asset, strat_name, direction, signal_name,
-                price, stop, target, size_usd, leverage,
+                entry_price, stop, target, size_usd, leverage,
             )
 
         pos = LivePosition(
@@ -791,7 +1048,7 @@ class LiveRunner:
 
         # iMessage alert
         msg = (
-            f"\U0001f7e2 OPEN {asset} {direction} @ ${price:.2f} | "
+            f"\U0001f7e2 OPEN {asset} {direction} @ ${entry_price:.2f} | "
             f"stop ${stop:.2f} target ${target:.2f} | ${size_usd:.0f} {leverage:.1f}x"
         )
         send_imsg(msg)

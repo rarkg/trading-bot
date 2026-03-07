@@ -141,6 +141,39 @@ class KrakenExecutor:
             params=params,
         )
 
+    def place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        price: float,
+        reduce_only: bool = False,
+        post_only: bool = True,
+    ) -> dict[str, Any]:
+        """Place a limit order (for smart entries).
+
+        Args:
+            symbol: Asset name ("BTC") or futures symbol.
+            side: "buy" or "sell".
+            size: Position size in contracts.
+            price: Limit price.
+            reduce_only: If True, only reduces existing position.
+            post_only: If True, order is maker-only (rejected if would take).
+        """
+        ccxt_symbol = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")
+        formatted_price = self._format_price(symbol, price)
+        params = {"reduceOnly": reduce_only}
+        if post_only:
+            params["postOnly"] = True
+        return self.client.exchange.create_order(
+            symbol=ccxt_symbol,
+            type="limit",
+            side=side.lower(),
+            amount=size,
+            price=formatted_price,
+            params=params,
+        )
+
     def cancel_order(self, order_id: str, symbol: str = "BTC") -> dict[str, Any]:
         """Cancel an open order."""
         ccxt_sym = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")

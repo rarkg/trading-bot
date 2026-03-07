@@ -233,7 +233,7 @@ class LiveRunner:
                 self._tick()  # full scan: fetch candles + entries + exits every 10 min
             except Exception:
                 log.exception("Error in main loop tick")
-            time.sleep(600)  # 10 minute interval
+            time.sleep(900)  # 15 minute interval
 
         log.info("=== Shutdown complete ===")
         self.pg.close()

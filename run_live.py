@@ -741,7 +741,7 @@ class LiveRunner:
         for attempt in range(1, MAX_FILL_ATTEMPTS + 1):
             try:
                 _time.sleep(1)
-                order_status = self.executor.exchange.fetch_order(order_id, ccxt_sym)
+                order_status = self.executor.client.exchange.fetch_order(order_id, ccxt_sym)
                 if order_status.get("status") == "closed":
                     actual_fill = float(order_status.get("average") or order_status.get("price") or price)
                     log.info("Fill confirmed (attempt %d): %s %s @ $%.4f (signal $%.4f)", attempt, asset, direction, actual_fill, price)
@@ -761,6 +761,13 @@ class LiveRunner:
 
         # Order succeeded — log to DB as OPEN with actual fill price
         trade.entry_price = actual_fill
+        fill_status = "✅ confirmed" if fill_confirmed else "⚠️ unconfirmed (signal price used)"
+        send_imsg(
+            f"✅ Trade opened: {asset} {direction}\n"
+            f"Signal: {signal_name}\n"
+            f"Entry: ${actual_fill:.4f} | Stop: ${stop:.4f} | Target: ${target:.4f}\n"
+            f"Size: ${size_usd:.0f} | Fill: {fill_status}"
+        )
         trade_id = None  # type: Optional[int]
         if self.bot_id is not None:
             trade_id = self.pg.log_trade_open(

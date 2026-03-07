@@ -16,6 +16,12 @@ SPOT_PAIRS: dict[str, str] = {
     "ETH": "ETHUSD",
     "SOL": "SOLUSD",
     "LINK": "LINKUSD",
+    "ADA": "ADAUSD",
+    "AVAX": "AVAXUSD",
+    "DOGE": "DOGEUSD",
+    "XRP": "XRPUSD",
+    "ICP": "ICPUSD",
+    "SHIB": "SHIBUSD",
 }
 
 FUTURES_SYMBOLS: dict[str, str] = {
@@ -23,6 +29,12 @@ FUTURES_SYMBOLS: dict[str, str] = {
     "ETH": "PF_ETHUSD",
     "SOL": "PF_SOLUSD",
     "LINK": "PF_LINKUSD",
+    "ADA": "PF_ADAUSD",
+    "AVAX": "PF_AVAXUSD",
+    "DOGE": "PF_DOGEUSD",
+    "XRP": "PF_XRPUSD",
+    "ICP": "PF_ICPUSD",
+    "SHIB": "PF_SHIBUSD",
 }
 
 # ccxt market IDs for Kraken Futures
@@ -31,6 +43,12 @@ CCXT_SYMBOLS: dict[str, str] = {
     "ETH": "ETH/USD:USD",
     "SOL": "SOL/USD:USD",
     "LINK": "LINK/USD:USD",
+    "ADA": "ADA/USD:USD",
+    "AVAX": "AVAX/USD:USD",
+    "DOGE": "DOGE/USD:USD",
+    "XRP": "XRP/USD:USD",
+    "ICP": "ICP/USD:USD",
+    "SHIB": "SHIB/USD:USD",
 }
 
 SPOT_BASE_URL = "https://api.kraken.com"

@@ -2,10 +2,10 @@
 
 # Account
 INITIAL_CAPITAL = 5_000.0  # USD total
-CAPITAL_PER_ASSET = INITIAL_CAPITAL / 4  # $1,250 per asset (BTC/ETH/SOL/LINK)
 
 # Assets
-ASSETS = ["BTC", "ETH", "SOL", "LINK"]
+ASSETS = ["BTC", "ETH", "SOL", "LINK", "ADA", "AVAX", "DOGE", "XRP", "ICP", "SHIB"]
+CAPITAL_PER_ASSET = INITIAL_CAPITAL / len(ASSETS)  # $500 per asset
 
 # Kraken symbol mapping
 SYMBOL_MAP = {
@@ -13,6 +13,12 @@ SYMBOL_MAP = {
     "ETH": "PF_ETHUSD",
     "SOL": "PF_SOLUSD",
     "LINK": "PF_LINKUSD",
+    "ADA": "PF_ADAUSD",
+    "AVAX": "PF_AVAXUSD",
+    "DOGE": "PF_DOGEUSD",
+    "XRP": "PF_XRPUSD",
+    "ICP": "PF_ICPUSD",
+    "SHIB": "PF_SHIBUSD",
 }
 
 # Risk

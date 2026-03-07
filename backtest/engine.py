@@ -169,25 +169,21 @@ class BacktestEngine:
                     # Dynamic leverage from signal (if provided)
                     sig_leverage = signal.get("leverage", 1.0)
                     
-                    # Position sizing for leveraged perps:
-                    # You deposit margin, control leverage * margin in position
-                    # Risk is still capped at max_risk_pct of CAPITAL (not position)
+                    # Position sizing: risk-based, fixed initial capital reference
+                    # Max loss per trade = max_risk_pct of INITIAL capital (not rolling)
+                    # This prevents runaway compounding in backtest
                     risk_per_unit = abs(price - stop) if stop else price * 0.02
-                    risk_pct = risk_per_unit / price if price > 0 else 0.02
+                    max_loss = self.initial_capital * self.max_risk_pct
                     
-                    # How much margin to use (capped at 40% of capital)
-                    margin = min(capital * 0.4, capital)
+                    if risk_per_unit > 0 and price > 0:
+                        # Size so that stop-loss hit = max_loss
+                        contracts = max_loss / risk_per_unit
+                        size = contracts * price / sig_leverage
+                    else:
+                        size = self.initial_capital * 0.15  # fallback: 15% of initial
                     
-                    # Position size = margin * leverage
-                    size = margin * sig_leverage
-                    
-                    # But cap so that a stop-loss hit doesn't lose more than max_risk_pct of capital
-                    max_loss = capital * self.max_risk_pct
-                    loss_per_unit = risk_per_unit * (size / price) if price > 0 else max_loss
-                    if loss_per_unit > max_loss and risk_per_unit > 0:
-                        size = max_loss / (risk_per_unit / price)
-                    
-                    size = min(size, capital * sig_leverage)  # Can't exceed leverage * capital
+                    # Hard cap: never risk more than 30% of initial capital per trade
+                    size = min(size, self.initial_capital * 0.30 * sig_leverage)
                     
                     open_trade = Trade(
                         entry_time=data.index[i],

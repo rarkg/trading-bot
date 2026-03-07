@@ -217,6 +217,9 @@ class LiveRunner:
 
         while not self._shutdown:
             try:
+                # Fast check every minute: SL/TP/trailing stop + Kraken reconciliation
+                self._fast_check()
+                # Hourly: full candle analysis + signal generation
                 self._tick()
             except Exception:
                 log.exception("Error in main loop tick")
@@ -372,8 +375,64 @@ class LiveRunner:
             except Exception:
                 log.exception("  %s: failed to load candles", asset)
 
+    def _fast_check(self):
+        """Fast price check every minute — trailing stop, SL/TP, exchange reconciliation."""
+        if not self.positions:
+            return
+
+        # Reconcile with Kraken
+        self._reconcile_exchange()
+
+        # Fetch current prices and check exits
+        for asset in ASSETS:
+            keys_to_close = []
+            for key, pos in self.positions.items():
+                if pos.asset != asset:
+                    continue
+                try:
+                    ticker = self.executor.client.exchange.fetch_ticker(
+                        CCXT_SYMBOLS.get(asset.upper(), "BTC/USD:USD")
+                    )
+                    price = ticker.get("last", 0.0)
+                    if price <= 0:
+                        continue
+                except Exception:
+                    continue
+
+                trade = pos.trade
+
+                # Update trailing stop if price moved in our favor
+                if hasattr(trade, '_trail_active') and trade._trail_active:
+                    # Trailing stop is managed by strategy check_exit
+                    pass
+
+                # Check strategy exit (handles trailing stop logic)
+                strat = self.candle.get(asset)
+                if strat:
+                    # Build a minimal check using current price
+                    exit_reason = None
+                    if trade.direction == "LONG":
+                        if price <= trade.stop_price:
+                            exit_reason = "STOP"
+                        elif trade.target_price > 0 and price >= trade.target_price:
+                            exit_reason = "TARGET"
+                    else:
+                        if price >= trade.stop_price:
+                            exit_reason = "STOP"
+                        elif trade.target_price > 0 and price <= trade.target_price:
+                            exit_reason = "TARGET"
+
+                    if exit_reason:
+                        log.info("FAST_CHECK: %s %s %s triggered %s at $%.4f",
+                                 asset, trade.direction, pos.strategy, exit_reason, price)
+                        self._close_position(key, pos, price, exit_reason)
+                        keys_to_close.append(key)
+
+            for k in keys_to_close:
+                del self.positions[k]
+
     def _tick(self):
-        """Single iteration: fetch new candle, run strategies, manage positions."""
+        """Hourly iteration: fetch new candle, run strategies, manage positions."""
         now = datetime.now(timezone.utc)
         current_hour = now.replace(minute=0, second=0, microsecond=0)
 

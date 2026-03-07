@@ -264,7 +264,7 @@ class PgWriter:
                     """SELECT COALESCE(SUM(equity), 0)
                        FROM bot_equity
                        WHERE bot_id = %s
-                         AND ts = (SELECT MAX(ts) FROM bot_equity WHERE bot_id = %s)""",
+                         AND recorded_at = (SELECT MAX(recorded_at) FROM bot_equity WHERE bot_id = %s)""",
                     (bot_id, bot_id),
                 )
                 row = cur.fetchone()

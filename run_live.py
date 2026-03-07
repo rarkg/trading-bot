@@ -653,6 +653,11 @@ class LiveRunner:
         leverage = sig.get("leverage", 1.0)
         signal_name = sig.get("signal", strat_name)
 
+        # Guard: reject signals with invalid price, stop, or target
+        if not price or not stop or not target or price <= 0 or stop <= 0 or target <= 0:
+            log.warning("SKIP %s: invalid signal values price=%.6f stop=%.6f target=%.6f", asset, price, stop, target)
+            return
+
         # Compound sizing: equity / n_assets, with floor and cap
         try:
             total_equity = self.pg.get_total_equity(self.bot_id) if self.bot_id is not None else 0.0

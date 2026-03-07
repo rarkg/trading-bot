@@ -51,6 +51,7 @@ ASSETS = config.ASSETS
 CAPITAL_PER_ASSET = config.CAPITAL_PER_ASSET
 MIN_BARS = 200  # minimum candles needed for indicators
 LOOP_INTERVAL_SEC = 60  # check every minute, act on new hourly candle
+DUST_THRESHOLD_USD = 10.0  # auto-close positions worth less than this
 
 # ---------------------------------------------------------------------------
 # Open position tracker
@@ -421,6 +422,10 @@ class LiveRunner:
                             exit_reason = "STOP"
                         elif trade.target_price > 0 and price <= trade.target_price:
                             exit_reason = "TARGET"
+
+                    # Dust check — close tiny positions not worth keeping
+                    if trade.size_usd and trade.size_usd < DUST_THRESHOLD_USD:
+                        exit_reason = "DUST"
 
                     if exit_reason:
                         log.info("FAST_CHECK: %s %s %s triggered %s at $%.4f",

@@ -156,13 +156,21 @@ def make_candle_strategies() -> dict[str, CandleV2_3]:
     strats = {}
     for asset in ASSETS:
         strats[asset] = CandleV2_3(
+            # Config 2: R:R 3:2, score>=4, all indicators, MTF both
+            min_score=4,
+            stop_atr=3.0,
+            target_atr=2.0,
             use_mtf=True,
-            mtf_require="any",
-            use_quality_filter=True,
-            min_body_ratio=0.3,
-            use_vol_regime=True,
-            bb_width_max_pct=85,
-            use_tod_filter=False,
+            mtf_require="both",
+            use_rsi=True, use_stoch_rsi=True, use_williams_r=True,
+            use_macd=True, use_cci=True, use_ema_alignment=True,
+            use_adx=True, use_bb=True, use_atr_percentile=True,
+            use_keltner=True, use_volume=True, use_mfi=True,
+            use_obv_slope=True, use_range_position=True, use_hh_ll=True,
+            pattern_set="top5",
+            adx_max=40,
+            cooldown=12,
+            time_exit_bars=144,
             base_leverage=2.0,
         )
     return strats

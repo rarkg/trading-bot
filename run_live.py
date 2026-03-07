@@ -6,13 +6,12 @@ Loops every hour:
   2. Feed to both strategies
   3. If signal → check risk → size → execute on Kraken demo
   4. Check open positions for stop/target hits
-  5. Log to console + SQLite
+  5. Log to console + Postgres
 """
 
 import os
 import sys
 import signal
-import sqlite3
 import subprocess
 import time
 import logging
@@ -52,96 +51,15 @@ MIN_BARS = 200  # minimum candles needed for indicators
 LOOP_INTERVAL_SEC = 60  # check every minute, act on new hourly candle
 
 # ---------------------------------------------------------------------------
-# SQLite trade log
-# ---------------------------------------------------------------------------
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "live_trades.db")
-
-
-def init_db() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            asset TEXT NOT NULL,
-            strategy TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            signal TEXT,
-            entry_price REAL,
-            stop_price REAL,
-            target_price REAL,
-            size_usd REAL,
-            leverage REAL,
-            exit_price REAL,
-            exit_reason TEXT,
-            pnl_usd REAL,
-            status TEXT DEFAULT 'OPEN'
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS decisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            asset TEXT NOT NULL,
-            strategy TEXT NOT NULL,
-            action TEXT NOT NULL,
-            details TEXT
-        )
-    """)
-    conn.commit()
-    return conn
-
-
-def log_decision(conn: sqlite3.Connection, asset: str, strategy: str, action: str, details: str = ""):
-    conn.execute(
-        "INSERT INTO decisions (ts, asset, strategy, action, details) VALUES (?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), asset, strategy, action, details),
-    )
-    conn.commit()
-
-
-def log_trade_open(conn: sqlite3.Connection, asset: str, strategy: str, trade: Trade) -> int:
-    cur = conn.execute(
-        """INSERT INTO trades (ts, asset, strategy, direction, signal, entry_price,
-           stop_price, target_price, size_usd, leverage, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
-        (
-            datetime.now(timezone.utc).isoformat(),
-            asset,
-            strategy,
-            trade.direction,
-            trade.signal,
-            trade.entry_price,
-            trade.stop_price,
-            trade.target_price,
-            trade.size_usd,
-            trade.leverage,
-        ),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def log_trade_close(conn: sqlite3.Connection, trade_id: int, exit_price: float, exit_reason: str, pnl_usd: float):
-    conn.execute(
-        "UPDATE trades SET exit_price=?, exit_reason=?, pnl_usd=?, status='CLOSED' WHERE id=?",
-        (exit_price, exit_reason, pnl_usd, trade_id),
-    )
-    conn.commit()
-
-
-# ---------------------------------------------------------------------------
 # Open position tracker
 # ---------------------------------------------------------------------------
 @dataclass
 class LivePosition:
-    trade_id: int  # SQLite row id
+    trade_id: Optional[int]  # Postgres trade id
     asset: str
     strategy: str
     trade: Trade
     order_id: Optional[str] = None
-    pg_trade_id: Optional[int] = None  # Postgres trade id
     sl_order_id: Optional[str] = None  # Exchange stop-loss order id
     tp_order_id: Optional[str] = None  # Exchange take-profit order id
 
@@ -231,9 +149,8 @@ class LiveRunner:
         self.feed = LiveFeed()
         self.executor = KrakenExecutor(api_key, api_secret, demo=config.DEMO)
         self.risk_mgr = RiskManager(max_risk_per_trade=config.MAX_RISK_PER_TRADE)
-        self.db = init_db()
 
-        # Postgres dual-write
+        # Postgres
         self.pg = PgWriter()
         self.bot_id = self.pg.register_bot("crypto-live", {
             "assets": config.ASSETS,
@@ -292,7 +209,6 @@ class LiveRunner:
             time.sleep(LOOP_INTERVAL_SEC)
 
         log.info("=== Shutdown complete ===")
-        self.db.close()
         self.pg.close()
 
     def _handle_signal(self, signum, frame):
@@ -300,7 +216,7 @@ class LiveRunner:
         self._shutdown = True
 
     def _sync_positions(self):
-        """Reconcile local DB positions with Kraken on startup."""
+        """Reconcile Postgres positions with Kraken on startup."""
         try:
             exchange_positions = self.executor.get_positions()
         except Exception:
@@ -312,17 +228,26 @@ class LiveRunner:
         for ep in exchange_positions:
             exchange_map[ep["symbol"]] = ep
 
-        # Check DB for OPEN trades that Kraken doesn't know about
-        cursor = self.db.execute("SELECT id, asset, strategy, direction, signal, entry_price, stop_price, target_price, size_usd, leverage FROM trades WHERE status='OPEN'")
-        db_open = cursor.fetchall()
+        # Check Postgres for OPEN trades that Kraken doesn't know about
+        db_open = self.pg.get_open_trades(self.bot_id) if self.bot_id is not None else []
 
         for row in db_open:
-            trade_id, asset, strategy, direction, sig, entry, stop, target, size_usd, leverage = row
+            trade_id = row["id"]
+            asset = row["asset"]
+            strategy = row["strategy"]
+            direction = row["direction"]
+            sig = row["signal"]
+            entry = row["entry_price"]
+            stop = row["stop_price"]
+            target = row["target_price"]
+            size_usd = row["size_usd"]
+            leverage = row["leverage"]
+
             ccxt_sym = CCXT_SYMBOLS.get(asset.upper(), "")
             if ccxt_sym not in exchange_map:
                 # DB has position, exchange doesn't — mark closed
                 log.warning("SYNC: %s %s position in DB but not on exchange — marking closed", asset, strategy)
-                log_trade_close(self.db, trade_id, entry, "SYNC_CLOSED", 0.0)
+                self.pg.close_trade_by_id(trade_id, "SYNC_CLOSED")
                 continue
 
             # Exchange has this position — load it into self.positions
@@ -369,8 +294,14 @@ class LiveRunner:
                 size_usd=ep["size"] * ep["entry_price"],
                 leverage=1.0,
             )
-            # Log to SQLite
-            trade_id = log_trade_open(self.db, asset_name, "synced", trade)
+            # Log to Postgres
+            trade_id = None
+            if self.bot_id is not None:
+                trade_id = self.pg.log_trade_open(
+                    self.bot_id, asset_name, "synced", direction, "synced",
+                    ep["entry_price"], 0.0, 0.0,
+                    trade.size_usd, 1.0,
+                )
             key = (asset_name, "synced")
             self.positions[key] = LivePosition(
                 trade_id=trade_id,
@@ -532,12 +463,9 @@ class LiveRunner:
         except Exception:
             log.exception("Failed to close %s %s position on exchange", pos.asset, pos.strategy)
 
-        # SQLite
-        log_trade_close(self.db, pos.trade_id, price, exit_reason, pnl_usd)
-
         # Postgres
-        if pos.pg_trade_id is not None:
-            self.pg.log_trade_close(pos.pg_trade_id, price, exit_reason, pnl_usd, pnl_pct * 100)
+        if pos.trade_id is not None:
+            self.pg.log_trade_close(pos.trade_id, price, exit_reason, pnl_usd, pnl_pct * 100)
 
         # iMessage alert
         sign = "+" if pnl_usd >= 0 else ""
@@ -553,7 +481,8 @@ class LiveRunner:
         if pos.strategy == "squeeze_v15":
             self.squeeze[pos.asset].record_trade(trade.direction, pnl_pct * 100, exit_reason)
 
-        log_decision(self.db, pos.asset, pos.strategy, "CLOSE", f"{exit_reason} pnl=${pnl_usd:.2f}")
+        if self.bot_id is not None:
+            self.pg.log_decision(self.bot_id, pos.asset, pos.strategy, "CLOSE", f"{exit_reason} pnl=${pnl_usd:.2f}")
 
     def _cancel_sl_tp(self, pos: LivePosition) -> None:
         """Cancel exchange stop-loss and take-profit orders for a position."""
@@ -616,7 +545,8 @@ class LiveRunner:
 
         # Check risk: drawdown limit
         if not self.risk_mgr.check_drawdown(asset, CAPITAL_PER_ASSET):
-            log_decision(self.db, asset, strat_name, "SKIP", "DD limit breached")
+            if self.bot_id is not None:
+                self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", "DD limit breached")
             return
 
         # Generate signal
@@ -625,6 +555,21 @@ class LiveRunner:
             return
 
         direction = sig["action"]
+
+        # V2.4: Correlation guard — limit concurrent same-direction positions
+        if getattr(strat, 'use_correlation_guard', False):
+            max_same = getattr(strat, 'max_same_direction', 3)
+            same_dir_count = sum(
+                1 for pos in self.positions.values()
+                if pos.trade.direction == direction
+            )
+            if same_dir_count >= max_same:
+                if self.bot_id is not None:
+                    self.pg.log_decision(
+                        self.bot_id, asset, strat_name, "SKIP",
+                        f"correlation_guard: {same_dir_count} {direction} already open",
+                    )
+                return
         stop = sig["stop"]
         target = sig["target"]
         leverage = sig.get("leverage", 1.0)
@@ -633,7 +578,8 @@ class LiveRunner:
         # Size position
         size_usd = size_position(sig, price, self.risk_mgr, CAPITAL_PER_ASSET)
         if size_usd <= 0:
-            log_decision(self.db, asset, strat_name, "SKIP", f"Size=0 for {signal_name}")
+            if self.bot_id is not None:
+                self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", f"Size=0 for {signal_name}")
             return
 
         # Create trade object
@@ -668,16 +614,14 @@ class LiveRunner:
             order_id = order.get("id", "")
         except Exception:
             log.exception("Failed to place %s %s order", asset, strat_name)
-            log_decision(self.db, asset, strat_name, "ERROR", f"Order failed for {signal_name}")
+            if self.bot_id is not None:
+                self.pg.log_decision(self.bot_id, asset, strat_name, "ERROR", f"Order failed for {signal_name}")
             return
 
-        # Track position
-        trade_id = log_trade_open(self.db, asset, strat_name, trade)
-
-        # Postgres dual-write
-        pg_trade_id = None  # type: Optional[int]
+        # Track position in Postgres
+        trade_id = None  # type: Optional[int]
         if self.bot_id is not None:
-            pg_trade_id = self.pg.log_trade_open(
+            trade_id = self.pg.log_trade_open(
                 self.bot_id, asset, strat_name, direction, signal_name,
                 price, stop, target, size_usd, leverage,
             )
@@ -688,7 +632,6 @@ class LiveRunner:
             strategy=strat_name,
             trade=trade,
             order_id=order_id,
-            pg_trade_id=pg_trade_id,
         )
         self.positions[key] = pos
 
@@ -703,7 +646,8 @@ class LiveRunner:
         send_imsg(msg)
 
         self._tick_opened += 1
-        log_decision(self.db, asset, strat_name, "OPEN", f"{signal_name} size=${size_usd:.0f}")
+        if self.bot_id is not None:
+            self.pg.log_decision(self.bot_id, asset, strat_name, "OPEN", f"{signal_name} size=${size_usd:.0f}")
 
 
 # ---------------------------------------------------------------------------

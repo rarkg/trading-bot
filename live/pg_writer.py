@@ -1,6 +1,6 @@
 """Postgres writer for the trading monitor dashboard.
 
-Dual-writes trade/equity/heartbeat data to Postgres alongside SQLite.
+Writes trade/equity/heartbeat data to Postgres (sole database).
 Graceful: if Postgres is down, logs a warning and continues (never crashes the bot).
 """
 
@@ -190,3 +190,50 @@ class PgWriter:
                 )
         except Exception:
             log.warning("Failed to log heartbeat in Postgres", exc_info=True)
+
+    def log_decision(
+        self,
+        bot_id: int,
+        asset: str,
+        strategy: str,
+        action: str,
+        details: str = "",
+    ) -> None:
+        """Log a decision (SKIP, ERROR, OPEN, CLOSE)."""
+        # Decisions go to log only — no separate table needed
+        log.info("DECISION %s %s %s: %s", asset, strategy, action, details)
+
+    def get_open_trades(self, bot_id: int) -> list:
+        """Get all open trades for a bot. Returns list of dicts."""
+        if not self._ensure_conn():
+            return []
+        try:
+            with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT id, asset, strategy, direction, signal,
+                              entry_price, stop_price, target_price,
+                              size_usd, leverage, opened_at
+                       FROM bot_trades
+                       WHERE bot_id=%s AND status='OPEN'
+                       ORDER BY opened_at""",
+                    (bot_id,),
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception:
+            log.warning("Failed to get open trades from Postgres", exc_info=True)
+            return []
+
+    def close_trade_by_id(self, trade_id: int, exit_reason: str = "SYNC_CLOSED") -> None:
+        """Mark a trade as closed (used during sync)."""
+        if not self._ensure_conn():
+            return
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE bot_trades
+                       SET status='CLOSED', exit_reason=%s, closed_at=%s
+                       WHERE id=%s AND status='OPEN'""",
+                    (exit_reason, datetime.now(timezone.utc), trade_id),
+                )
+        except Exception:
+            log.warning("Failed to close trade %s in Postgres", trade_id, exc_info=True)

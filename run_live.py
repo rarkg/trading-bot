@@ -598,8 +598,22 @@ class LiveRunner:
         leverage = sig.get("leverage", 1.0)
         signal_name = sig.get("signal", strat_name)
 
+        # Compound sizing: equity / n_assets, with floor and cap
+        try:
+            total_equity = self.pg.get_total_equity(self.bot_id) if self.bot_id is not None else 0.0
+            if total_equity > 0:
+                slot_size = total_equity / len(ASSETS)
+                slot_size = max(slot_size, CAPITAL_PER_ASSET)           # floor: never below initial
+                slot_size = min(slot_size, CAPITAL_PER_ASSET * 10)      # cap: max 10x initial per slot
+            else:
+                slot_size = CAPITAL_PER_ASSET                            # fallback to fixed
+            log.info("Compound sizing: total_equity=%.2f slot_size=%.2f", total_equity or 0, slot_size)
+        except Exception:
+            slot_size = CAPITAL_PER_ASSET
+            log.warning("Compound sizing failed — using fixed CAPITAL_PER_ASSET")
+
         # Size position — apply V2.5 multipliers
-        base_capital = CAPITAL_PER_ASSET
+        base_capital = slot_size
         adaptive_mult = self.adaptive_sizer.get_multiplier(direction)
         regime_dir_mult = regime_state.direction_multiplier(direction)
         vol_mult = regime_state.volatility_multiplier

@@ -232,6 +232,25 @@ class PgWriter:
         # Decisions go to log only — no separate table needed
         log.info("DECISION %s %s %s: %s", asset, strategy, action, details)
 
+    def get_total_equity(self, bot_id: int) -> float:
+        """Return total portfolio equity (sum across all assets) from latest snapshot."""
+        if not self._ensure_conn():
+            return 0.0
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COALESCE(SUM(equity), 0)
+                       FROM bot_equity
+                       WHERE bot_id = %s
+                         AND ts = (SELECT MAX(ts) FROM bot_equity WHERE bot_id = %s)""",
+                    (bot_id, bot_id),
+                )
+                row = cur.fetchone()
+                return float(row[0]) if row else 0.0
+        except Exception:
+            log.warning("Failed to get total equity from Postgres", exc_info=True)
+            return 0.0
+
     def get_open_trades(self, bot_id: int) -> list:
         """Get all open trades for a bot. Returns list of dicts."""
         if not self._ensure_conn():

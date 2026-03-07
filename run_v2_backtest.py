@@ -327,7 +327,24 @@ def print_summary(results):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _run_asset(args):
+    """Worker function for parallel backtest — one asset per process."""
+    asset, StrategyCls, params, start_date, end_date = args
+    df = load_data(asset, start=start_date, end=end_date)
+    if df is None or len(df) < 250:
+        return asset, None
+    engine = BacktestEngine(
+        initial_capital=CAPITAL_PER_ASSET,
+        fee_pct=FEE_PCT,
+        max_risk_pct=MAX_RISK_PCT,
+    )
+    strategy = StrategyCls(**params)
+    result = engine.run(df, strategy, name=f"{asset}")
+    return asset, result
+
+
 def main():
+    import multiprocessing as mp
     start_date = os.environ.get("BT_START", "2022-01-01")
     end_date = os.environ.get("BT_END", "2026-03-01")
 
@@ -338,31 +355,20 @@ def main():
     print("  Params: %s" % params)
     print("=" * 70)
 
-    engine = BacktestEngine(
-        initial_capital=CAPITAL_PER_ASSET,
-        fee_pct=FEE_PCT,
-        max_risk_pct=MAX_RISK_PCT,
-    )
-
     results = {}
     t0 = time.time()
 
-    for asset in ASSETS:
-        print(f"\n--- {asset} ---")
-        df = load_data(asset, start=start_date, end=end_date)
-        if df is None or len(df) < 250:
-            print(f"  Skipped: insufficient data ({len(df) if df is not None else 0} bars)")
-            continue
-
-        print(f"  Bars: {len(df)} | {df.index[0].date()} to {df.index[-1].date()}")
-
-        strategy = StrategyCls(**params)
-        result = engine.run(df, strategy, name=f"{label} {asset}")
-        results[asset] = result
-
-        print(f"  Trades: {result.total_trades} | WR: {result.win_rate:.1f}% | "
-              f"PnL: ${result.total_pnl_usd:+,.2f} ({result.total_pnl_pct:+.1f}%) | "
-              f"DD: {result.max_drawdown_pct:.1f}%")
+    # Run all assets in parallel (one process per asset)
+    n_workers = min(len(ASSETS), mp.cpu_count())
+    args = [(a, StrategyCls, params, start_date, end_date) for a in ASSETS]
+    print(f"\n  Running {len(ASSETS)} assets in parallel ({n_workers} workers)...")
+    with mp.Pool(processes=n_workers) as pool:
+        for asset, result in pool.map(_run_asset, args):
+            if result is not None:
+                results[asset] = result
+                print(f"  ✓ {asset}: {result.total_trades} trades | WR {result.win_rate:.1f}% | PnL ${result.total_pnl_usd:+,.0f}")
+            else:
+                print(f"  ✗ {asset}: skipped (insufficient data)")
 
     elapsed = time.time() - t0
     print(f"\nBacktest completed in {elapsed:.1f}s")

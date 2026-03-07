@@ -377,6 +377,10 @@ class LiveRunner:
                 if asset != "BTC":
                     strat.set_btc_data(self.candle_cache["BTC"])
 
+        # --- Reconcile DB vs Kraken every cycle ---
+        # Any trade OPEN in DB but not on Kraken gets closed immediately
+        self._reconcile_db_with_exchange()
+
         # Reset tick counters
         self._tick_signals = 0
         self._tick_opened = 0
@@ -436,6 +440,31 @@ class LiveRunner:
                 self.bot_id, self._tick_signals,
                 self._tick_opened, self._tick_closed, total_equity,
             )
+
+    def _reconcile_db_with_exchange(self) -> None:
+        """Every cycle: close any DB-OPEN trades that no longer exist on Kraken.
+        This prevents the dashboard showing trades that were already closed on exchange."""
+        if self.bot_id is None:
+            return
+        try:
+            exchange_positions = self.executor.get_positions()
+            exchange_assets = {p["asset"].upper() for p in exchange_positions if p.get("asset")}
+
+            db_open = self.pg.get_open_trades(self.bot_id)
+            for row in db_open:
+                asset = row["asset"].upper()
+                trade_id = row["id"]
+                if asset not in exchange_assets:
+                    # In DB as OPEN but Kraken doesn't have it — close in DB
+                    log.warning("RECONCILE: %s is OPEN in DB (id=%d) but not on Kraken — closing", asset, trade_id)
+                    self.pg.close_trade_by_id(trade_id, "EXCHANGE_CLOSED")
+                    # Also remove from in-memory positions
+                    keys_to_remove = [k for k, p in self.positions.items() if p.asset == asset]
+                    for k in keys_to_remove:
+                        del self.positions[k]
+                        log.info("RECONCILE: Removed %s from in-memory positions", asset)
+        except Exception:
+            log.warning("RECONCILE: Failed to reconcile DB with exchange", exc_info=True)
 
     def _check_exits(self, asset: str, df: pd.DataFrame, i: int, price: float):
         """Check if any open positions should be closed."""

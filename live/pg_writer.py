@@ -1,0 +1,192 @@
+"""Postgres writer for the trading monitor dashboard.
+
+Dual-writes trade/equity/heartbeat data to Postgres alongside SQLite.
+Graceful: if Postgres is down, logs a warning and continues (never crashes the bot).
+"""
+
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+import psycopg2
+import psycopg2.extras
+
+log = logging.getLogger("live.pg")
+
+DSN = "postgresql://elio@localhost:5432/trading_monitor"
+
+
+class PgWriter:
+    """Graceful Postgres writer — all public methods swallow exceptions."""
+
+    def __init__(self, dsn: str = DSN) -> None:
+        self.dsn = dsn
+        self._conn = None  # type: Optional[psycopg2.extensions.connection]
+        self._connect()
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+    def _connect(self) -> None:
+        try:
+            self._conn = psycopg2.connect(self.dsn)
+            self._conn.autocommit = True
+            log.info("Connected to Postgres (%s)", self.dsn)
+        except Exception:
+            log.warning("Postgres unavailable — will retry on next write", exc_info=True)
+            self._conn = None
+
+    def _ensure_conn(self) -> bool:
+        """Return True if we have a usable connection."""
+        if self._conn is not None:
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                return True
+            except Exception:
+                self._conn = None
+        # Try to reconnect
+        self._connect()
+        return self._conn is not None
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    # ------------------------------------------------------------------
+    # Public API (all graceful)
+    # ------------------------------------------------------------------
+    def register_bot(self, name: str, config: dict) -> Optional[int]:
+        """Register or update a bot. Returns bot_id or None on failure."""
+        if not self._ensure_conn():
+            return None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO bots (name, config, started_at, updated_at)
+                       VALUES (%s, %s, %s, NOW())
+                       ON CONFLICT (name) DO UPDATE
+                         SET config = EXCLUDED.config,
+                             status = 'running',
+                             started_at = EXCLUDED.started_at,
+                             updated_at = NOW()
+                       RETURNING id""",
+                    (name, json.dumps(config), datetime.now(timezone.utc)),
+                )
+                row = cur.fetchone()
+                bot_id = row[0] if row else None
+                log.info("Registered bot '%s' with id=%s", name, bot_id)
+                return bot_id
+        except Exception:
+            log.warning("Failed to register bot in Postgres", exc_info=True)
+            return None
+
+    def log_trade_open(
+        self,
+        bot_id: int,
+        asset: str,
+        strategy: str,
+        direction: str,
+        signal: str,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
+        size_usd: float,
+        leverage: float,
+    ) -> Optional[int]:
+        """Log a trade open. Returns the Postgres trade id or None."""
+        if not self._ensure_conn():
+            return None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO bot_trades
+                       (bot_id, asset, strategy, direction, signal,
+                        entry_price, stop_price, target_price, size_usd,
+                        leverage, status, opened_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
+                       RETURNING id""",
+                    (
+                        bot_id, asset, strategy, direction, signal,
+                        entry_price, stop_price, target_price, size_usd,
+                        leverage, datetime.now(timezone.utc),
+                    ),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception:
+            log.warning("Failed to log trade open in Postgres", exc_info=True)
+            return None
+
+    def log_trade_close(
+        self,
+        pg_trade_id: int,
+        exit_price: float,
+        exit_reason: str,
+        pnl_usd: float,
+        pnl_pct: float,
+    ) -> None:
+        """Log a trade close."""
+        if not self._ensure_conn():
+            return
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE bot_trades
+                       SET exit_price=%s, exit_reason=%s, pnl_usd=%s, pnl_pct=%s,
+                           status='CLOSED', closed_at=%s
+                       WHERE id=%s""",
+                    (exit_price, exit_reason, pnl_usd, pnl_pct,
+                     datetime.now(timezone.utc), pg_trade_id),
+                )
+        except Exception:
+            log.warning("Failed to log trade close in Postgres", exc_info=True)
+
+    def log_equity(
+        self,
+        bot_id: int,
+        asset: str,
+        equity: float,
+        pnl_total: float,
+        open_positions: int,
+    ) -> None:
+        """Log per-asset equity snapshot."""
+        if not self._ensure_conn():
+            return
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO bot_equity
+                       (bot_id, asset, equity, pnl_total, open_positions)
+                       VALUES (%s,%s,%s,%s,%s)""",
+                    (bot_id, asset, equity, pnl_total, open_positions),
+                )
+        except Exception:
+            log.warning("Failed to log equity in Postgres", exc_info=True)
+
+    def log_heartbeat(
+        self,
+        bot_id: int,
+        signals_evaluated: int,
+        trades_opened: int,
+        trades_closed: int,
+        total_equity: float,
+    ) -> None:
+        """Log a heartbeat."""
+        if not self._ensure_conn():
+            return
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO bot_heartbeats
+                       (bot_id, signals_evaluated, trades_opened, trades_closed, total_equity)
+                       VALUES (%s,%s,%s,%s,%s)""",
+                    (bot_id, signals_evaluated, trades_opened, trades_closed, total_equity),
+                )
+        except Exception:
+            log.warning("Failed to log heartbeat in Postgres", exc_info=True)

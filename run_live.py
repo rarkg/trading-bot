@@ -13,11 +13,12 @@ import os
 import sys
 import signal
 import sqlite3
+import subprocess
 import time
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -28,7 +29,9 @@ from backtest.engine import Trade
 from live.feed import LiveFeed
 from live.executor import KrakenExecutor
 from live.risk import RiskManager
+from live.pg_writer import PgWriter
 from live import config
+from live.exchange.kraken import CCXT_SYMBOLS
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -138,6 +141,27 @@ class LivePosition:
     strategy: str
     trade: Trade
     order_id: Optional[str] = None
+    pg_trade_id: Optional[int] = None  # Postgres trade id
+    sl_order_id: Optional[str] = None  # Exchange stop-loss order id
+    tp_order_id: Optional[str] = None  # Exchange take-profit order id
+
+
+# ---------------------------------------------------------------------------
+# iMessage alerts
+# ---------------------------------------------------------------------------
+IMSG_CHAT_ID = "dan.k.ngo@gmail.com"
+
+
+def send_imsg(message: str) -> None:
+    """Send an iMessage alert. Swallows errors."""
+    try:
+        subprocess.run(
+            ["imsg", "send", "--chat-id", IMSG_CHAT_ID, "--text", message],
+            timeout=10,
+            capture_output=True,
+        )
+    except Exception:
+        log.warning("Failed to send iMessage alert", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +233,15 @@ class LiveRunner:
         self.risk_mgr = RiskManager(max_risk_per_trade=config.MAX_RISK_PER_TRADE)
         self.db = init_db()
 
+        # Postgres dual-write
+        self.pg = PgWriter()
+        self.bot_id = self.pg.register_bot("crypto-live", {
+            "assets": config.ASSETS,
+            "capital": config.INITIAL_CAPITAL,
+            "demo": config.DEMO,
+            "strategies": ["candle_v2_3"],
+        })  # type: Optional[int]
+
         # Strategies: one per asset per strategy type
         self.squeeze = make_squeeze_strategies()
         self.candle = make_candle_strategies()
@@ -222,6 +255,11 @@ class LiveRunner:
         # Track last processed hour to avoid duplicate processing
         self.last_processed_hour: Optional[datetime] = None
 
+        # Tick counters for heartbeat
+        self._tick_signals = 0
+        self._tick_opened = 0
+        self._tick_closed = 0
+
         self._shutdown = False
 
     def run(self):
@@ -231,6 +269,9 @@ class LiveRunner:
         log.info("=== Live Runner starting (demo=%s) ===", config.DEMO)
         log.info("Capital: $%.0f ($%.0f per asset)", config.INITIAL_CAPITAL, CAPITAL_PER_ASSET)
         log.info("Assets: %s", ASSETS)
+
+        # Sync positions with exchange on startup
+        self._sync_positions()
 
         # Initial data load — get enough history for indicators
         self._load_initial_data()
@@ -252,10 +293,98 @@ class LiveRunner:
 
         log.info("=== Shutdown complete ===")
         self.db.close()
+        self.pg.close()
 
     def _handle_signal(self, signum, frame):
         log.info("Received signal %d, shutting down gracefully...", signum)
         self._shutdown = True
+
+    def _sync_positions(self):
+        """Reconcile local DB positions with Kraken on startup."""
+        try:
+            exchange_positions = self.executor.get_positions()
+        except Exception:
+            log.exception("Failed to fetch exchange positions for sync")
+            return
+
+        # Build map of exchange positions: ccxt_symbol -> pos dict
+        exchange_map = {}  # type: dict[str, dict]
+        for ep in exchange_positions:
+            exchange_map[ep["symbol"]] = ep
+
+        # Check DB for OPEN trades that Kraken doesn't know about
+        cursor = self.db.execute("SELECT id, asset, strategy, direction, signal, entry_price, stop_price, target_price, size_usd, leverage FROM trades WHERE status='OPEN'")
+        db_open = cursor.fetchall()
+
+        for row in db_open:
+            trade_id, asset, strategy, direction, sig, entry, stop, target, size_usd, leverage = row
+            ccxt_sym = CCXT_SYMBOLS.get(asset.upper(), "")
+            if ccxt_sym not in exchange_map:
+                # DB has position, exchange doesn't — mark closed
+                log.warning("SYNC: %s %s position in DB but not on exchange — marking closed", asset, strategy)
+                log_trade_close(self.db, trade_id, entry, "SYNC_CLOSED", 0.0)
+                continue
+
+            # Exchange has this position — load it into self.positions
+            ep = exchange_map.pop(ccxt_sym)
+            trade = Trade(
+                entry_time=pd.Timestamp.now(tz="UTC"),
+                entry_price=ep["entry_price"] if ep["entry_price"] > 0 else entry,
+                direction=direction,
+                signal=sig or strategy,
+                stop_price=stop,
+                target_price=target,
+                size_usd=size_usd,
+                leverage=leverage if leverage else 1.0,
+            )
+            key = (asset, strategy)
+            self.positions[key] = LivePosition(
+                trade_id=trade_id,
+                asset=asset,
+                strategy=strategy,
+                trade=trade,
+            )
+            log.info("SYNC: Loaded %s %s %s position from DB (entry=%.2f)", asset, strategy, direction, trade.entry_price)
+
+        # Exchange has positions the bot doesn't know about — load them
+        for ccxt_sym, ep in exchange_map.items():
+            # Reverse lookup asset name from ccxt symbol
+            asset_name = None
+            for a, s in CCXT_SYMBOLS.items():
+                if s == ccxt_sym:
+                    asset_name = a
+                    break
+            if asset_name is None:
+                log.warning("SYNC: Unknown exchange position %s — skipping", ccxt_sym)
+                continue
+
+            direction = "LONG" if ep["side"] == "long" else "SHORT"
+            trade = Trade(
+                entry_time=pd.Timestamp.now(tz="UTC"),
+                entry_price=ep["entry_price"],
+                direction=direction,
+                signal="synced",
+                stop_price=0.0,
+                target_price=0.0,
+                size_usd=ep["size"] * ep["entry_price"],
+                leverage=1.0,
+            )
+            # Log to SQLite
+            trade_id = log_trade_open(self.db, asset_name, "synced", trade)
+            key = (asset_name, "synced")
+            self.positions[key] = LivePosition(
+                trade_id=trade_id,
+                asset=asset_name,
+                strategy="synced",
+                trade=trade,
+            )
+            log.warning("SYNC: Found exchange position %s %s (%.4f contracts) NOT in DB — loaded as synced",
+                        asset_name, direction, ep["size"])
+
+        if self.positions:
+            log.info("SYNC: %d active positions after reconciliation", len(self.positions))
+        else:
+            log.info("SYNC: No open positions")
 
     def _load_initial_data(self):
         """Fetch initial candle history for all assets."""
@@ -299,6 +428,11 @@ class LiveRunner:
                 if asset != "BTC":
                     strat.set_btc_data(self.candle_cache["BTC"])
 
+        # Reset tick counters
+        self._tick_signals = 0
+        self._tick_opened = 0
+        self._tick_closed = 0
+
         # Process each asset
         for asset in ASSETS:
             if asset not in self.candle_cache:
@@ -317,6 +451,20 @@ class LiveRunner:
             # Generate signals from strategies
             # self._run_strategy(asset, "squeeze_v15", self.squeeze[asset], df, i, price)  # V15 disabled per Dan
             self._run_strategy(asset, "candle_v2_3", self.candle[asset], df, i, price)
+            self._tick_signals += 1
+
+            # Log equity to Postgres
+            if self.bot_id is not None:
+                open_count = sum(1 for pos in self.positions.values() if pos.asset == asset)
+                self.pg.log_equity(self.bot_id, asset, CAPITAL_PER_ASSET, 0.0, open_count)
+
+        # Heartbeat
+        if self.bot_id is not None:
+            total_equity = CAPITAL_PER_ASSET * len(ASSETS)
+            self.pg.log_heartbeat(
+                self.bot_id, self._tick_signals,
+                self._tick_opened, self._tick_closed, total_equity,
+            )
 
     def _check_exits(self, asset: str, df: pd.DataFrame, i: int, price: float):
         """Check if any open positions should be closed."""
@@ -353,7 +501,7 @@ class LiveRunner:
             del self.positions[k]
 
     def _close_position(self, key: tuple, pos: LivePosition, price: float, exit_reason: str):
-        """Close a position: place reduce-only order and log."""
+        """Close a position: cancel SL/TP, place reduce-only order, log, alert."""
         trade = pos.trade
         close_side = "sell" if trade.direction == "LONG" else "buy"
         size_contracts = trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0
@@ -370,6 +518,9 @@ class LiveRunner:
             exit_reason, price, pnl_usd, pnl_pct * 100,
         )
 
+        # Cancel exchange SL/TP orders before closing
+        self._cancel_sl_tp(pos)
+
         try:
             self.executor.place_order(
                 symbol=pos.asset,
@@ -381,13 +532,77 @@ class LiveRunner:
         except Exception:
             log.exception("Failed to close %s %s position on exchange", pos.asset, pos.strategy)
 
+        # SQLite
         log_trade_close(self.db, pos.trade_id, price, exit_reason, pnl_usd)
+
+        # Postgres
+        if pos.pg_trade_id is not None:
+            self.pg.log_trade_close(pos.pg_trade_id, price, exit_reason, pnl_usd, pnl_pct * 100)
+
+        # iMessage alert
+        sign = "+" if pnl_usd >= 0 else ""
+        msg = (
+            f"\U0001f534 CLOSE {pos.asset} {trade.direction} @ ${price:.2f} | "
+            f"{sign}${pnl_usd:.0f} ({sign}{pnl_pct * 100:.1f}%) | reason: {exit_reason}"
+        )
+        send_imsg(msg)
+
+        self._tick_closed += 1
 
         # Report to strategy's adaptive manager
         if pos.strategy == "squeeze_v15":
             self.squeeze[pos.asset].record_trade(trade.direction, pnl_pct * 100, exit_reason)
 
         log_decision(self.db, pos.asset, pos.strategy, "CLOSE", f"{exit_reason} pnl=${pnl_usd:.2f}")
+
+    def _cancel_sl_tp(self, pos: LivePosition) -> None:
+        """Cancel exchange stop-loss and take-profit orders for a position."""
+        for label, oid in [("SL", pos.sl_order_id), ("TP", pos.tp_order_id)]:
+            if oid is None:
+                continue
+            try:
+                self.executor.cancel_order(oid, pos.asset)
+                log.info("Cancelled %s order %s for %s", label, oid, pos.asset)
+            except Exception:
+                log.warning("Failed to cancel %s order %s for %s", label, oid, pos.asset, exc_info=True)
+        pos.sl_order_id = None
+        pos.tp_order_id = None
+
+    def _place_sl_tp(self, pos: LivePosition) -> None:
+        """Place exchange stop-loss and take-profit orders for a position."""
+        trade = pos.trade
+        close_side = "sell" if trade.direction == "LONG" else "buy"
+        size_contracts = trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0
+        if size_contracts <= 0:
+            return
+
+        # Stop-loss
+        if trade.stop_price and trade.stop_price > 0:
+            try:
+                sl_order = self.executor.place_stop_order(
+                    symbol=pos.asset,
+                    side=close_side,
+                    size=abs(size_contracts),
+                    stop_price=trade.stop_price,
+                )
+                pos.sl_order_id = sl_order.get("id", "")
+                log.info("Placed SL order %s for %s @ %.2f", pos.sl_order_id, pos.asset, trade.stop_price)
+            except Exception:
+                log.warning("Failed to place SL order for %s", pos.asset, exc_info=True)
+
+        # Take-profit
+        if trade.target_price and trade.target_price > 0:
+            try:
+                tp_order = self.executor.place_take_profit_order(
+                    symbol=pos.asset,
+                    side=close_side,
+                    size=abs(size_contracts),
+                    tp_price=trade.target_price,
+                )
+                pos.tp_order_id = tp_order.get("id", "")
+                log.info("Placed TP order %s for %s @ %.2f", pos.tp_order_id, pos.asset, trade.target_price)
+            except Exception:
+                log.warning("Failed to place TP order for %s", pos.asset, exc_info=True)
 
     def _run_strategy(
         self, asset: str, strat_name: str, strat, df: pd.DataFrame, i: int, price: float
@@ -458,14 +673,36 @@ class LiveRunner:
 
         # Track position
         trade_id = log_trade_open(self.db, asset, strat_name, trade)
-        self.positions[key] = LivePosition(
+
+        # Postgres dual-write
+        pg_trade_id = None  # type: Optional[int]
+        if self.bot_id is not None:
+            pg_trade_id = self.pg.log_trade_open(
+                self.bot_id, asset, strat_name, direction, signal_name,
+                price, stop, target, size_usd, leverage,
+            )
+
+        pos = LivePosition(
             trade_id=trade_id,
             asset=asset,
             strategy=strat_name,
             trade=trade,
             order_id=order_id,
+            pg_trade_id=pg_trade_id,
         )
+        self.positions[key] = pos
 
+        # Place exchange SL/TP orders for crash protection
+        self._place_sl_tp(pos)
+
+        # iMessage alert
+        msg = (
+            f"\U0001f7e2 OPEN {asset} {direction} @ ${price:.2f} | "
+            f"stop ${stop:.2f} target ${target:.2f} | ${size_usd:.0f} {leverage:.1f}x"
+        )
+        send_imsg(msg)
+
+        self._tick_opened += 1
         log_decision(self.db, asset, strat_name, "OPEN", f"{signal_name} size=${size_usd:.0f}")
 
 

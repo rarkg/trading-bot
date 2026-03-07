@@ -69,6 +69,62 @@ class KrakenExecutor:
             reduce_only=reduce_only,
         )
 
+    def place_stop_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        stop_price: float,
+        reduce_only: bool = True,
+    ) -> dict[str, Any]:
+        """Place a stop-market order (for stop-loss protection).
+
+        Args:
+            symbol: Asset name ("BTC") or futures symbol.
+            side: "buy" or "sell" — the closing side.
+            size: Position size in contracts.
+            stop_price: Trigger price for the stop.
+            reduce_only: Default True (safety — only reduces position).
+        """
+        ccxt_symbol = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")
+        params = {"stopPrice": stop_price, "reduceOnly": reduce_only}
+        return self.client.exchange.create_order(
+            symbol=ccxt_symbol,
+            type="stop",
+            side=side.lower(),
+            amount=size,
+            price=None,
+            params=params,
+        )
+
+    def place_take_profit_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        tp_price: float,
+        reduce_only: bool = True,
+    ) -> dict[str, Any]:
+        """Place a take-profit market order.
+
+        Args:
+            symbol: Asset name ("BTC") or futures symbol.
+            side: "buy" or "sell" — the closing side.
+            size: Position size in contracts.
+            tp_price: Trigger price for take-profit.
+            reduce_only: Default True.
+        """
+        ccxt_symbol = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")
+        params = {"stopPrice": tp_price, "reduceOnly": reduce_only}
+        return self.client.exchange.create_order(
+            symbol=ccxt_symbol,
+            type="takeProfit",
+            side=side.lower(),
+            amount=size,
+            price=None,
+            params=params,
+        )
+
     def cancel_order(self, order_id: str, symbol: str = "BTC") -> dict[str, Any]:
         """Cancel an open order."""
         ccxt_sym = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")

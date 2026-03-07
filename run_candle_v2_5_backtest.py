@@ -27,7 +27,7 @@ from live.regime import RegimeDetector
 
 ASSETS = ["BTC", "ETH", "SOL", "LINK", "ADA", "AVAX", "DOGE", "XRP", "ICP", "SHIB"]
 
-CAPITAL = 400.0
+CAPITAL = 500.0  # $5K total / 10 assets
 FEE_PCT = 0.15
 MAX_RISK_PCT = 2.0
 

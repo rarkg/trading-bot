@@ -113,8 +113,9 @@ class PgWriter:
                        RETURNING id""",
                     (
                         bot_id, asset, strategy, direction, signal,
-                        entry_price, stop_price, target_price, size_usd,
-                        leverage, datetime.now(timezone.utc),
+                        float(entry_price), float(stop_price) if stop_price is not None else None,
+                        float(target_price) if target_price is not None else None,
+                        float(size_usd), float(leverage), datetime.now(timezone.utc),
                     ),
                 )
                 row = cur.fetchone()

@@ -68,3 +68,15 @@ module.exports = {
     },
   ],
 };
+
+// ============================================================
+// DEV ENVIRONMENT — isolated from production
+// Branch: dev | DB: trading_monitor_dev | Ports: 3003+
+// Paul works here. Never touch production directly.
+// ============================================================
+
+// NOTE: Add these manually to pm2 when needed:
+// pm2 start services/trader.py --name crypto-dev --interpreter python3 -- --env DB_NAME=trading_monitor_dev MODE=paper STRATEGY_VERSION=v2.5
+// pm2 start services/candle_collector.py --name candle-dev --interpreter python3 -- --env DB_NAME=trading_monitor_dev
+// pm2 start services/exchange_sync.py --name exchange-sync-dev --interpreter python3 -- --env DB_NAME=trading_monitor_dev
+// Dev dashboard runs on port 3003

@@ -217,6 +217,17 @@ class LiveRunner:
 
         log.info("Initial data loaded. Entering main loop.")
 
+        # Start background thread: write live position status every 10s
+        import threading
+        def _position_status_loop():
+            while not self._shutdown:
+                try:
+                    self._write_live_status()
+                except Exception:
+                    pass
+                time.sleep(10)
+        threading.Thread(target=_position_status_loop, daemon=True).start()
+
         while not self._shutdown:
             try:
                 self._tick()  # full scan: fetch candles + entries + exits every 10 min
@@ -445,6 +456,48 @@ class LiveRunner:
                 self.bot_id, self._tick_signals,
                 self._tick_opened, self._tick_closed, total_equity,
             )
+
+    def _write_live_status(self) -> None:
+        """Write current open positions + live PnL to /tmp/bot-live-status.json every 10s."""
+        import json as _json
+        positions_out = []
+        for key, pos in list(self.positions.items()):
+            try:
+                ccxt_sym = CCXT_SYMBOLS.get(pos.asset.upper(), "")
+                ticker = self.executor.client.exchange.fetch_ticker(ccxt_sym) if ccxt_sym else {}
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+                t = pos.trade
+                if price > 0:
+                    if t.direction == "LONG":
+                        unr_pct = (price - t.entry_price) / t.entry_price * 100
+                    else:
+                        unr_pct = (t.entry_price - price) / t.entry_price * 100
+                    unr_usd = t.size_usd * unr_pct / 100
+                else:
+                    price = unr_pct = unr_usd = 0.0
+                positions_out.append({
+                    "asset": pos.asset,
+                    "direction": t.direction,
+                    "entry": round(t.entry_price, 6),
+                    "current": round(price, 6),
+                    "stop": round(t.stop_price, 6),
+                    "target": round(t.target_price, 6),
+                    "size_usd": round(t.size_usd, 2),
+                    "unr_usd": round(unr_usd, 2),
+                    "unr_pct": round(unr_pct, 3),
+                    "trade_id": pos.trade_id,
+                })
+            except Exception:
+                pass
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "positions": positions_out,
+        }
+        try:
+            with open("/tmp/bot-live-status.json", "w") as f:
+                _json.dump(payload, f)
+        except Exception:
+            pass
 
     def _fast_exit_check(self) -> None:
         """Check exits every 10 minutes using live ticker price (not waiting for new candle)."""

@@ -402,14 +402,31 @@ class LiveRunner:
             self._run_strategy(asset, "candle_v2_3", self.candle[asset], df, i, price)
             self._tick_signals += 1
 
-            # Log equity to Postgres
+            # Log equity to Postgres — real equity = slot capital + unrealized PnL on open pos
             if self.bot_id is not None:
                 open_count = sum(1 for pos in self.positions.values() if pos.asset == asset)
-                self.pg.log_equity(self.bot_id, asset, CAPITAL_PER_ASSET, 0.0, open_count)
+                asset_key = (asset, "candle_v2_3")
+                unrealized = 0.0
+                if asset_key in self.positions:
+                    pos = self.positions[asset_key]
+                    if pos.trade.direction == "LONG":
+                        unrealized = (price - pos.trade.entry_price) / pos.trade.entry_price * pos.trade.size_usd
+                    else:
+                        unrealized = (pos.trade.entry_price - price) / pos.trade.entry_price * pos.trade.size_usd
+                slot_equity = CAPITAL_PER_ASSET + unrealized
+                self.pg.log_equity(self.bot_id, asset, slot_equity, unrealized, open_count)
 
-        # Heartbeat
+        # Heartbeat — total equity = initial capital + all unrealized PnL
         if self.bot_id is not None:
             total_equity = CAPITAL_PER_ASSET * len(ASSETS)
+            for pos in self.positions.values():
+                df_cache = self.candle_cache.get(pos.asset)
+                price_now = float(df_cache.iloc[-1]["close"]) if df_cache is not None and len(df_cache) > 0 else 0.0
+                if price_now > 0:
+                    if pos.trade.direction == "LONG":
+                        total_equity += (price_now - pos.trade.entry_price) / pos.trade.entry_price * pos.trade.size_usd
+                    else:
+                        total_equity += (pos.trade.entry_price - price_now) / pos.trade.entry_price * pos.trade.size_usd
             self.pg.log_heartbeat(
                 self.bot_id, self._tick_signals,
                 self._tick_opened, self._tick_closed, total_equity,

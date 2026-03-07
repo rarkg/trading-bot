@@ -4,6 +4,7 @@ Ensures no single trade risks more than 2% of account equity.
 """
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 # Per-asset maximum drawdown limits (fraction of equity)
@@ -33,7 +34,7 @@ class RiskManager:
 
     def __init__(
         self,
-        dd_limits: dict[str, float] | None = None,
+        dd_limits: Optional[dict] = None,
         max_risk_per_trade: float = MAX_RISK_PER_TRADE,
     ) -> None:
         """Initialize RiskManager.

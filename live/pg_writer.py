@@ -232,6 +232,28 @@ class PgWriter:
         # Decisions go to log only — no separate table needed
         log.info("DECISION %s %s %s: %s", asset, strategy, action, details)
 
+    def cancel_stale_pending_trades(self, bot_id: int, older_than_minutes: int = 5) -> int:
+        """Cancel PENDING trades older than N minutes — order never confirmed.
+        Returns number of trades cancelled."""
+        if not self._ensure_conn():
+            return 0
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE bot_trades
+                       SET status='CLOSED', exit_reason='PENDING_TIMEOUT', closed_at=NOW()
+                       WHERE bot_id=%s AND status='PENDING'
+                         AND created_at < NOW() - INTERVAL '%s minutes'""",
+                    (bot_id, older_than_minutes),
+                )
+                count = cur.rowcount
+                if count:
+                    log.warning("Cancelled %d stale PENDING trades (>%dm old)", count, older_than_minutes)
+                return count
+        except Exception:
+            log.warning("Failed to cancel stale pending trades", exc_info=True)
+            return 0
+
     def get_total_equity(self, bot_id: int) -> float:
         """Return total portfolio equity (sum across all assets) from latest snapshot."""
         if not self._ensure_conn():

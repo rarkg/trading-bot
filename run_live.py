@@ -237,6 +237,10 @@ class LiveRunner:
             log.exception("Failed to fetch exchange positions for sync")
             return
 
+        # Cancel stale PENDING trades first (order never confirmed)
+        if self.bot_id is not None:
+            self.pg.cancel_stale_pending_trades(self.bot_id, older_than_minutes=5)
+
         # Build map of exchange positions: ccxt_symbol -> pos dict
         exchange_map = {}  # type: dict[str, dict]
         for ep in exchange_positions:

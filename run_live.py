@@ -215,19 +215,12 @@ class LiveRunner:
 
         log.info("Initial data loaded. Entering main loop.")
 
-        self._last_exit_check = datetime.now(timezone.utc)
-
         while not self._shutdown:
             try:
-                self._tick()
-                # Fast exit check every 10 minutes using live price
-                now = datetime.now(timezone.utc)
-                if (now - self._last_exit_check).total_seconds() >= 600:
-                    self._fast_exit_check()
-                    self._last_exit_check = now
+                self._tick()  # full scan: fetch candles + entries + exits every 10 min
             except Exception:
                 log.exception("Error in main loop tick")
-            time.sleep(LOOP_INTERVAL_SEC)
+            time.sleep(600)  # 10 minute interval
 
         log.info("=== Shutdown complete ===")
         self.pg.close()
@@ -363,17 +356,11 @@ class LiveRunner:
                 log.exception("  %s: failed to load candles", asset)
 
     def _tick(self):
-        """Single iteration: fetch new candle, run strategies, manage positions."""
+        """Single iteration: fetch fresh candles and scan for entries every 10 min."""
         now = datetime.now(timezone.utc)
         current_hour = now.replace(minute=0, second=0, microsecond=0)
 
-        # Only process once per hour (with 2-min grace for candle finalization)
-        if now.minute < 2:
-            return
-        if self.last_processed_hour and self.last_processed_hour >= current_hour:
-            return
-
-        log.info("--- Processing hour: %s ---", current_hour.isoformat())
+        log.info("--- Scanning: %s ---", now.strftime("%H:%M UTC"))
         self.last_processed_hour = current_hour
 
         # Fetch latest candles for all assets
@@ -390,6 +377,9 @@ class LiveRunner:
             for asset, strat in self.squeeze.items():
                 if asset != "BTC":
                     strat.set_btc_data(self.candle_cache["BTC"])
+
+        # Check exits with live price first (before signal scan)
+        self._fast_exit_check()
 
         # --- Reconcile DB vs Kraken every cycle ---
         # Any trade OPEN in DB but not on Kraken gets closed immediately

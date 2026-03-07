@@ -113,7 +113,7 @@ def make_candle_strategies() -> dict[str, CandleV2_3]:
             use_obv_slope=True, use_range_position=True, use_hh_ll=True,
             pattern_set="top5",
             adx_max=50,
-            cooldown=12,
+            cooldown=0,  # disabled temporarily
             time_exit_bars=144,
             base_leverage=2.0,
             # V2.5 trailing stop (tighter trail)

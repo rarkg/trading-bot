@@ -419,7 +419,7 @@ class LiveRunner:
         # Heartbeat — fetch real balance from Kraken as source of truth
         if self.bot_id is not None:
             try:
-                balance = self.executor.exchange.fetch_balance()
+                balance = self.executor.client.exchange.fetch_balance()
                 total_equity = float(balance.get("total", {}).get("USD", 0) or 0)
                 unrealized = sum(
                     float(p.get("unrealizedPnl") or 0)

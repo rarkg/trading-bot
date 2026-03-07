@@ -306,8 +306,8 @@ class LiveRunner:
             # Check exits on open positions first
             self._check_exits(asset, df, i, price)
 
-            # Generate signals from both strategies
-            self._run_strategy(asset, "squeeze_v15", self.squeeze[asset], df, i, price)
+            # Generate signals from strategies
+            # self._run_strategy(asset, "squeeze_v15", self.squeeze[asset], df, i, price)  # V15 disabled per Dan
             self._run_strategy(asset, "candle_v2_3", self.candle[asset], df, i, price)
 
     def _check_exits(self, asset: str, df: pd.DataFrame, i: int, price: float):

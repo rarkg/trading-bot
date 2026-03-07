@@ -662,38 +662,60 @@ class LiveRunner:
                 price, stop, target, size_usd, leverage,
             )
 
-        try:
-            order = self.executor.place_order(
-                symbol=asset,
-                side=order_side,
-                size=size_contracts,
-                order_type="mkt",
-            )
-            order_id = order.get("id", "")
-        except Exception:
-            log.exception("Failed to place %s %s order", asset, strat_name)
-            # Mark PENDING trade as FAILED
-            if trade_id and self.bot_id is not None:
-                self.pg.cancel_pending_trade(trade_id, f"Order placement failed: {signal_name}")
-                self.pg.log_decision(self.bot_id, asset, strat_name, "ERROR", f"Order failed for {signal_name}")
-            return
+        import time as _time
 
-        # Confirm fill — get actual fill price from exchange
+        # Place order with retry (up to 3 attempts, 2s apart)
+        order = None
+        order_id = ""
+        MAX_ORDER_ATTEMPTS = 3
+        for attempt in range(1, MAX_ORDER_ATTEMPTS + 1):
+            try:
+                order = self.executor.place_order(
+                    symbol=asset,
+                    side=order_side,
+                    size=size_contracts,
+                    order_type="mkt",
+                )
+                order_id = order.get("id", "")
+                log.info("Order placed (attempt %d): %s %s id=%s", attempt, asset, direction, order_id)
+                break
+            except Exception as e:
+                log.warning("Order attempt %d/%d failed for %s %s: %s", attempt, MAX_ORDER_ATTEMPTS, asset, strat_name, e)
+                if attempt < MAX_ORDER_ATTEMPTS:
+                    _time.sleep(2)
+                else:
+                    log.error("All %d order attempts failed for %s %s", MAX_ORDER_ATTEMPTS, asset, strat_name)
+                    if trade_id and self.bot_id is not None:
+                        self.pg.cancel_pending_trade(trade_id, f"Order failed after {MAX_ORDER_ATTEMPTS} attempts: {signal_name}")
+                        self.pg.log_decision(self.bot_id, asset, strat_name, "ERROR", f"Order failed after {MAX_ORDER_ATTEMPTS} attempts for {signal_name}")
+                    return
+
+        # Confirm fill — retry up to 3 times with 1s delay
         actual_fill = price  # fallback
-        try:
-            import time as _time
-            _time.sleep(0.5)  # brief wait for fill
-            order_status = self.executor.exchange.fetch_order(order_id, CCXT_SYMBOLS.get(asset, asset + "/USD:USD"))
-            if order_status.get("status") == "closed":
-                actual_fill = float(order_status.get("average") or order_status.get("price") or price)
-                log.info("Fill confirmed: %s %s @ $%.4f (signal price $%.4f)", asset, direction, actual_fill, price)
-            elif order_status.get("status") == "canceled":
-                if trade_id and self.bot_id:
-                    self.pg.cancel_pending_trade(trade_id, "Order cancelled by exchange")
-                log.warning("Order cancelled by exchange for %s %s", asset, strat_name)
-                return
-        except Exception:
-            log.warning("Could not confirm fill for %s — using signal price", asset)
+        MAX_FILL_ATTEMPTS = 3
+        fill_confirmed = False
+        ccxt_sym = CCXT_SYMBOLS.get(asset, asset + "/USD:USD")
+        for attempt in range(1, MAX_FILL_ATTEMPTS + 1):
+            try:
+                _time.sleep(1)
+                order_status = self.executor.exchange.fetch_order(order_id, ccxt_sym)
+                if order_status.get("status") == "closed":
+                    actual_fill = float(order_status.get("average") or order_status.get("price") or price)
+                    log.info("Fill confirmed (attempt %d): %s %s @ $%.4f (signal $%.4f)", attempt, asset, direction, actual_fill, price)
+                    fill_confirmed = True
+                    break
+                elif order_status.get("status") == "canceled":
+                    if trade_id and self.bot_id:
+                        self.pg.cancel_pending_trade(trade_id, "Order cancelled by exchange")
+                    log.warning("Order cancelled by exchange for %s %s", asset, strat_name)
+                    return
+                else:
+                    log.info("Fill attempt %d/%d: order status=%s, retrying...", attempt, MAX_FILL_ATTEMPTS, order_status.get("status"))
+            except Exception as e:
+                log.warning("Fill confirm attempt %d/%d failed for %s: %s", attempt, MAX_FILL_ATTEMPTS, asset, e)
+
+        if not fill_confirmed:
+            log.warning("Could not confirm fill for %s after %d attempts — using signal price $%.4f", asset, MAX_FILL_ATTEMPTS, price)
 
         # Confirm trade as OPEN with actual fill price
         if trade_id:

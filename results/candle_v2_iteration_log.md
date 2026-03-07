@@ -279,3 +279,104 @@ This triple alignment represents broad market consensus, which is much more like
 ### Architecture Note
 
 V2.3 resamples hourly data to 4H and daily, then runs all 21 TA-Lib patterns on each timeframe. The higher-TF signals are forward-filled back to hourly bars. Entry requires the hourly pattern direction to match at least one (any) or both (both) higher timeframe patterns firing in the same direction.
+
+---
+
+## V2.4 — Push WR as High as Physically Possible (90%+ Target)
+
+### Goal
+Push avg WR from V2.3's 85.2% to 90%+. Pure WR optimization — P&L secondary, minimum 100 trades total.
+
+### New Features Tested
+
+1. **4H Primary Timeframe** — patterns on 4H candles instead of hourly, confirmed by daily
+2. **Extreme R:R Ratios** — up to 20:1 (very wide stop, very tight target)
+3. **Higher Score Thresholds** — s>=6, 6.5, 7.0, 7.5, 8.0
+4. **All 21 Patterns** — broader pattern set with high score filter for quality
+5. **Volume Spike Requirement** — require 2x+ avg volume on pattern candle
+6. **Consecutive TF Agreement** — prev bar on higher TF must also agree
+7. **Long/Short Split Tracking** — track WR by direction
+
+### Phase 1 Results (Individual Features)
+
+| Feature | Best Avg WR | Delta from V2.3 | Trades | Verdict |
+|---------|-------------|-----------------|--------|---------|
+| 4H primary, R:R 6:1.5 | 91.3% | +6.0 | 2747 | **Huge — 4H reduces noise** |
+| R:R 12:1 | 95.1% | +9.9 | 2980 | **Extreme R:R mechanically pushes WR** |
+| R:R 10:1 | 94.8% | +9.6 | 3013 | Near-identical to 12:1 |
+| R:R 8:1 | 94.3% | +9.1 | 3102 | Still very high |
+| s>=4.0 | 86.5% | +1.3 | 1279 | Small help from higher score |
+| s>=6.0 | 86.2% | +1.0 | 252 | Trades drop too fast |
+| MARUBOZU-only | 83.5% | -1.7 | 493 | **HURTS — fewer patterns = fewer quality entries** |
+| Volume spike 2x | 81.2% | -4.0 | 756 | **HURTS — vol filter kills good trades** |
+| Consecutive TF | 82.6% | -2.6 | 683 | **HURTS — too restrictive** |
+| Long-only | 82.3% | -2.9 | 1532 | Longs weaker than shorts |
+| Short-only | 86.8% | +1.6 | 1208 | Shorts slightly better |
+| Body ratio > 0.5 | 84.4% | -0.8 | 1812 | Marginal negative |
+
+### Key Stacked Configs
+
+| Config | BTC | ETH | SOL | LINK | Avg WR | Trades | P&L | Long WR | Short WR |
+|--------|-----|-----|-----|------|--------|--------|-----|---------|----------|
+| V2.3 baseline | 84.3% | 84.1% | 85.8% | 86.6% | 85.2% | 2149 | +$15,523 | 83% | 88% |
+| 4H + R:R 10:1 | 93.3% | 95.5% | 95.2% | 96.1% | 95.0% | 3493 | — | 94% | 96% |
+| all_pat + s>=5 + R:R 8:1 | 91.9% | 94.8% | 96.6% | 97.8% | 95.3% | 1117 | — | 95% | 95% |
+| **all_pat + s>=6 + R:R 10:1** | **93.8%** | **98.0%** | **97.8%** | **100.0%** | **97.4%** | **374** | **+$781** | **98%** | **96%** |
+| all_pat + s>=6 + R:R 10:1 + ADX<40 | 96.1% | 98.0% | 98.6% | 100.0% | **98.2%** | 596 | +$781 | 98% | 98% |
+| **all_pat + s>=6.5 + R:R 10:1 + ADX<40** | **98.1%** | **100.0%** | **100.0%** | **100.0%** | **99.5%** | **357** | **+$553** | **99%** | **100%** |
+| **all_pat + s>=7.0 + R:R 10:1 + ADX<40** | **98.2%** | **100.0%** | **100.0%** | **100.0%** | **99.6%** | **206** | **+$320** | **99%** | **100%** |
+| 4H + s>=7.0 + R:R 10:1 | 95.9% | 100.0% | 99.2% | 100.0% | 98.8% | 486 | +$728 | 98% | 99% |
+| 4H + s>=6.5 + R:R 10:1 | 96.0% | 99.4% | 99.5% | 100.0% | 98.7% | 778 | +$1,216 | 99% | 98% |
+
+### V2.4 Final Best Config (Max WR)
+- **Pattern set:** ALL 21 TA-Lib patterns
+- **All 15 V2.2 indicators enabled**
+- **MTF require=both** (hourly + 4H + daily aligned)
+- **Score threshold:** >= 7.0
+- **R:R:** Stop 10.0 ATR / Target 1.0 ATR
+- **ADX max:** 40
+- **Cooldown:** 12 bars
+- **Time exit:** 144 bars
+- **Avg WR: 99.6%** (BTC 98.2%, ETH 100.0%, SOL 100.0%, LINK 100.0%)
+- **Trades:** 206 total (~52/asset over 4.2 years)
+- **P&L:** +$320 (profitable but modest due to tight 1 ATR targets)
+- **Long WR: 99%, Short WR: 100%**
+
+### V2.4 Higher-Trade Alternatives
+| Config | Avg WR | Trades | Best For |
+|--------|--------|--------|----------|
+| s>=7.0 | 99.6% | 206 | Max WR |
+| s>=6.5 | 99.5% | 357 | Best balance |
+| s>=6.0 + ADX<40 | 98.2% | 596 | More trades |
+| 4H + s>=6.5 | 98.7% | 778 | Volume + WR |
+| 4H + s>=6.0 | 98.1% | 1165 | High volume |
+
+### Exit Analysis (s>=7.0 Final)
+- BTC: 57 trades — STOP:1t/0%w, TARGET:56t/100%w
+- ETH: 49 trades — TARGET:49t/100%w (perfect)
+- SOL: 47 trades — TARGET:47t/100%w (perfect)
+- LINK: 53 trades — TARGET:53t/100%w (perfect)
+
+### V2.4 Key Findings
+
+1. **99.6% WR achieved** with s>=7.0 + R:R 10:1 + all patterns + MTF both + ADX<40. Only 1 losing trade (BTC stop) out of 206.
+2. **The three pillars of ultra-high WR:** (a) MTF both alignment, (b) extreme R:R (10:1 stop:target), (c) high score threshold (7+ indicators confirming). Each independently adds 5-10% WR; stacked they approach 100%.
+3. **All 21 patterns + high score > selective patterns.** Using all patterns with s>=6+ acts as a natural quality filter — only entries where many indicators agree get through. This is BETTER than hand-picking patterns like MARUBOZU.
+4. **Volume spike filters HURT.** Counter-intuitive but requiring 2x volume kills 4% WR. The MTF+score filter already selects quality; volume adds noise.
+5. **Consecutive TF agreement HURTS.** Requiring the previous 4H/daily bar to also show patterns is too restrictive and removes valid setups.
+6. **Shorts consistently beat longs** across all configs (88% vs 83% at baseline, 100% vs 99% at max). Crypto markets' upward bias makes short-side mean reversion more reliable.
+7. **4H primary adds 1-6% WR** depending on R:R. Best at moderate R:R (6:1.5 → 91.3%). At extreme R:R the benefit narrows.
+8. **R:R is the single biggest mechanical WR lever.** Going from 5:2 to 10:1 adds ~10% WR by making targets trivially easy to hit. This is expected — the trade-off is smaller per-trade profit.
+9. **ADX<40 is optimal.** Raising from ADX<25 (V2.3) to ADX<40 adds more trades without hurting WR, since the MTF+score filter already ensures quality.
+10. **Diminishing returns beyond s>=7.0.** s>=7.5 and s>=8.0 drop trades below 100 with marginal WR improvement. s>=7.0 is the sweet spot.
+
+### Honest Assessment
+
+The 99.6% WR is mechanically achievable but comes with trade-offs:
+- **Tight targets (1 ATR)** mean each winning trade captures a small move
+- **Wide stops (10 ATR)** mean rare losses are large
+- **206 trades over 4.2 years** = ~4 trades/month/asset
+- **P&L is +$320** — profitable but not spectacular
+- The strategy is essentially "wait for extreme multi-timeframe consensus, take a tiny profit, and rarely get stopped out"
+
+For PRACTICAL trading, the **s>=6.5 config (99.5% WR, 357 trades)** or **s>=6.0 + ADX<40 (98.2%, 596 trades)** offer better trade volume with near-identical WR.

@@ -493,14 +493,38 @@ class LiveRunner:
             self._run_strategy(asset, "candle_v2_3", self.candle[asset], df, i, price)
             self._tick_signals += 1
 
-            # Log equity to Postgres
+            # Log equity to Postgres (with real unrealized P&L)
             if self.bot_id is not None:
-                open_count = sum(1 for pos in self.positions.values() if pos.asset == asset)
-                self.pg.log_equity(self.bot_id, asset, CAPITAL_PER_ASSET, 0.0, open_count)
+                open_count = 0
+                unrealized_pnl = 0.0
+                for pos in self.positions.values():
+                    if pos.asset == asset:
+                        open_count += 1
+                        trade = pos.trade
+                        if trade.direction == "LONG":
+                            pnl_pct = (price - trade.entry_price) / trade.entry_price if trade.entry_price > 0 else 0
+                        else:
+                            pnl_pct = (trade.entry_price - price) / trade.entry_price if trade.entry_price > 0 else 0
+                        unrealized_pnl += pnl_pct * trade.size_usd * trade.leverage
+                asset_equity = CAPITAL_PER_ASSET + unrealized_pnl
+                self.pg.log_equity(self.bot_id, asset, asset_equity, unrealized_pnl, open_count)
 
         # Heartbeat
         if self.bot_id is not None:
-            total_equity = CAPITAL_PER_ASSET * len(ASSETS)
+            total_equity = 0.0
+            for asset in ASSETS:
+                asset_pnl = 0.0
+                if asset in self.candle_cache and len(self.candle_cache[asset]) > 0:
+                    price = float(self.candle_cache[asset].iloc[-1]["close"])
+                    for pos in self.positions.values():
+                        if pos.asset == asset:
+                            trade = pos.trade
+                            if trade.direction == "LONG":
+                                pnl_pct = (price - trade.entry_price) / trade.entry_price if trade.entry_price > 0 else 0
+                            else:
+                                pnl_pct = (trade.entry_price - price) / trade.entry_price if trade.entry_price > 0 else 0
+                            asset_pnl += pnl_pct * trade.size_usd * trade.leverage
+                total_equity += CAPITAL_PER_ASSET + asset_pnl
             self.pg.log_heartbeat(
                 self.bot_id, self._tick_signals,
                 self._tick_opened, self._tick_closed, total_equity,

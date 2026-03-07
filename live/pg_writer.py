@@ -89,28 +89,28 @@ class PgWriter:
     def confirm_trade_open(self, pg_trade_id: int, actual_fill_price: float) -> None:
         """Confirm a PENDING trade is now OPEN with the actual fill price."""
         try:
-            with self.conn.cursor() as cur:
+            with self._conn.cursor() as cur:
                 cur.execute(
                     """UPDATE bot_trades
                        SET status='OPEN', entry_price=%s
                        WHERE id=%s AND status='PENDING'""",
                     (float(actual_fill_price), pg_trade_id),
                 )
-                self.conn.commit()
+                self._conn.commit()
         except Exception:
             log.warning("Failed to confirm trade open in Postgres", exc_info=True)
 
     def cancel_pending_trade(self, pg_trade_id: int, reason: str) -> None:
         """Mark a PENDING trade as FAILED (order rejected/not filled)."""
         try:
-            with self.conn.cursor() as cur:
+            with self._conn.cursor() as cur:
                 cur.execute(
                     """UPDATE bot_trades
                        SET status='FAILED', exit_reason=%s, closed_at=%s
                        WHERE id=%s AND status='PENDING'""",
                     (reason, datetime.now(timezone.utc), pg_trade_id),
                 )
-                self.conn.commit()
+                self._conn.commit()
         except Exception:
             log.warning("Failed to cancel pending trade in Postgres", exc_info=True)
 

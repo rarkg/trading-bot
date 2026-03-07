@@ -1202,6 +1202,7 @@ class LiveRunner:
         signal_name = sig.get("signal", strat_name)
 
         # ─── Position sizing ───
+        combined_mult = 1.0  # default, overwritten below if using legacy sizing
         if self.use_pct_sizing:
             size_usd = self._pct_size_position(
                 sig, price, direction, regime_state, leverage,

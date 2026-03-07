@@ -292,6 +292,15 @@ class PostgresDataProvider(DataProvider):
             return self._fallback.get_latest_price(asset)
         return 0.0
 
+    def close(self):
+        """Close the Postgres connection."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
     def ingest_candle(
         self,
         asset: str,
@@ -319,3 +328,71 @@ class PostgresDataProvider(DataProvider):
                 )
         except Exception:
             log.warning("Failed to ingest candle for %s", asset, exc_info=True)
+
+
+class CsvDataProvider(DataProvider):
+    """Reads candles from local CSV files. For backtest mode only.
+
+    Expects files at data/{ASSET}_USD_hourly.csv and data/{ASSET}_USD_15m.csv.
+    """
+
+    _CSV_SUFFIXES = {"1h": "_USD_hourly.csv", "15m": "_USD_15m.csv"}
+
+    def __init__(self, data_dir=None):
+        # type: (Optional[str]) -> None
+        self.data_dir = data_dir or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+        )
+        self._cache = {}  # type: dict
+
+    def get_candles(self, asset, timeframe="1h", limit=720):
+        # type: (str, str, int) -> pd.DataFrame
+        cache_key = (asset.upper(), timeframe)
+        if cache_key in self._cache:
+            df = self._cache[cache_key]
+            if len(df) > limit:
+                return df.iloc[-limit:]
+            return df
+
+        suffix = self._CSV_SUFFIXES.get(timeframe)
+        if suffix is None:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+        csv_path = os.path.join(self.data_dir, "%s%s" % (asset.upper(), suffix))
+        if not os.path.exists(csv_path):
+            log.warning("CSV not found: %s", csv_path)
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+        try:
+            df = pd.read_csv(csv_path)
+            df.columns = [c.lower().strip() for c in df.columns]
+
+            ts_col = None
+            for candidate in ["timestamp", "date", "datetime", "time"]:
+                if candidate in df.columns:
+                    ts_col = candidate
+                    break
+            if ts_col is None:
+                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+            df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+            df = df.set_index(ts_col).sort_index()
+            # Keep only OHLCV columns
+            for col in ["open", "high", "low", "close", "volume"]:
+                if col not in df.columns:
+                    df[col] = 0.0
+            df = df[["open", "high", "low", "close", "volume"]]
+            self._cache[cache_key] = df
+            if len(df) > limit:
+                return df.iloc[-limit:]
+            return df
+        except Exception:
+            log.warning("Failed to load CSV for %s %s", asset, timeframe, exc_info=True)
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    def get_latest_price(self, asset):
+        # type: (str,) -> float
+        df = self.get_candles(asset, "1h", limit=1)
+        if len(df) > 0:
+            return float(df.iloc[-1]["close"])
+        return 0.0

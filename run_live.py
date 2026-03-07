@@ -270,14 +270,21 @@ class LiveRunner:
 
             # Exchange has this position — load it into self.positions
             ep = exchange_map.pop(ccxt_sym)
+            # Use actual Kraken entry price and compute real size in USD
+            actual_entry = ep["entry_price"] if ep["entry_price"] > 0 else entry
+            actual_size = float(ep["size"]) * actual_entry if ep.get("size") and actual_entry > 0 else size_usd
+            # Correct DB if entry price or size was inaccurate (e.g. signal-price fallback)
+            if abs(actual_entry - entry) > 0.0001 or abs(actual_size - size_usd) > 1.0:
+                log.info("SYNC: Correcting %s entry %.6f→%.6f size $%.2f→$%.2f", asset, entry, actual_entry, size_usd, actual_size)
+                self.pg.update_trade_entry(trade_id, actual_entry, actual_size)
             trade = Trade(
                 entry_time=pd.Timestamp.now(tz="UTC"),
-                entry_price=ep["entry_price"] if ep["entry_price"] > 0 else entry,
+                entry_price=actual_entry,
                 direction=direction,
                 signal=sig or strategy,
                 stop_price=stop,
                 target_price=target,
-                size_usd=size_usd,
+                size_usd=actual_size,
                 leverage=leverage if leverage else 1.0,
             )
             key = (asset, strategy)
@@ -287,7 +294,7 @@ class LiveRunner:
                 strategy=strategy,
                 trade=trade,
             )
-            log.info("SYNC: Loaded %s %s %s position from DB (entry=%.2f)", asset, strategy, direction, trade.entry_price)
+            log.info("SYNC: Loaded %s %s %s entry=%.6f size=$%.2f", asset, strategy, direction, actual_entry, actual_size)
 
         # Exchange has positions the bot doesn't know about — load them
         for ccxt_sym, ep in exchange_map.items():

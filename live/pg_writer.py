@@ -293,6 +293,21 @@ class PgWriter:
             log.warning("Failed to get open trades from Postgres", exc_info=True)
             return []
 
+    def update_trade_entry(self, trade_id: int, entry_price: float, size_usd: float) -> None:
+        """Correct entry price and size with actual exchange values."""
+        if not self._ensure_conn():
+            return
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE bot_trades
+                       SET entry_price=%s, size_usd=%s
+                       WHERE id=%s AND status='OPEN'""",
+                    (entry_price, size_usd, trade_id),
+                )
+        except Exception:
+            log.warning("Failed to update trade entry %s", trade_id, exc_info=True)
+
     def close_trade_by_id(self, trade_id: int, exit_reason: str = "SYNC_CLOSED") -> None:
         """Mark a trade as closed (used during sync)."""
         if not self._ensure_conn():

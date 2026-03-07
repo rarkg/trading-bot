@@ -223,82 +223,17 @@ class PgWriter:
             log.warning("Failed to get open trades from Postgres", exc_info=True)
             return []
 
-    def close_trade_by_id(
-        self,
-        trade_id: int,
-        exit_reason: str = "SYNC_CLOSED",
-        exit_price: float = 0.0,
-        pnl_usd: float = 0.0,
-        pnl_pct: float = 0.0,
-    ) -> None:
-        """Mark a trade as closed with optional real PnL data."""
+    def close_trade_by_id(self, trade_id: int, exit_reason: str = "SYNC_CLOSED") -> None:
+        """Mark a trade as closed (used during sync)."""
         if not self._ensure_conn():
             return
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
                     """UPDATE bot_trades
-                       SET status='CLOSED', exit_reason=%s, closed_at=%s,
-                           exit_price=COALESCE(NULLIF(%s, 0), exit_price),
-                           pnl_usd=COALESCE(NULLIF(%s, 0), pnl_usd),
-                           pnl_pct=COALESCE(NULLIF(%s, 0), pnl_pct)
+                       SET status='CLOSED', exit_reason=%s, closed_at=%s
                        WHERE id=%s AND status='OPEN'""",
-                    (exit_reason, datetime.now(timezone.utc),
-                     exit_price, pnl_usd, pnl_pct, trade_id),
+                    (exit_reason, datetime.now(timezone.utc), trade_id),
                 )
         except Exception:
             log.warning("Failed to close trade %s in Postgres", trade_id, exc_info=True)
-
-    def update_trade_levels(
-        self,
-        trade_id: int,
-        stop_price: float,
-        target_price: float,
-    ) -> None:
-        """Update stop and target levels for an open trade."""
-        if not self._ensure_conn():
-            return
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    """UPDATE bot_trades
-                       SET stop_price=%s, target_price=%s
-                       WHERE id=%s AND status='OPEN'""",
-                    (stop_price, target_price, trade_id),
-                )
-        except Exception:
-            log.warning("Failed to update trade levels for %s", trade_id, exc_info=True)
-
-    def update_trade_size(self, trade_id: int, size_usd: float) -> None:
-        """Update position size for an open trade (after reconciliation)."""
-        if not self._ensure_conn():
-            return
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    """UPDATE bot_trades SET size_usd=%s WHERE id=%s AND status='OPEN'""",
-                    (size_usd, trade_id),
-                )
-        except Exception:
-            log.warning("Failed to update trade size for %s", trade_id, exc_info=True)
-
-    def log_account_equity(
-        self,
-        bot_id: int,
-        equity: float,
-        unrealized_pnl: float,
-        open_positions: int,
-    ) -> None:
-        """Log account-level equity snapshot (from Kraken balance)."""
-        if not self._ensure_conn():
-            return
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO bot_equity
-                       (bot_id, asset, equity, pnl_total, open_positions)
-                       VALUES (%s, %s, %s, %s, %s)""",
-                    (bot_id, "ACCOUNT", equity, unrealized_pnl, open_positions),
-                )
-        except Exception:
-            log.warning("Failed to log account equity in Postgres", exc_info=True)

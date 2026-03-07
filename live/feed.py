@@ -12,7 +12,6 @@ from live.exchange.kraken import KrakenSpotClient, SPOT_PAIRS
 
 # Kraken interval values in minutes
 INTERVALS: dict[str, int] = {
-    "15m": 15,
     "1h": 60,
     "4h": 240,
     "1d": 1440,

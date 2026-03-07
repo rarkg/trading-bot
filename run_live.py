@@ -162,7 +162,7 @@ class LiveRunner:
             "assets": config.ASSETS,
             "capital": config.INITIAL_CAPITAL,
             "demo": config.DEMO,
-            "strategies": ["candle_v2_3"],
+            "strategies": ["candle_v2_5"],
         })  # type: Optional[int]
 
         # Strategies: one per asset per strategy type
@@ -408,13 +408,13 @@ class LiveRunner:
             self._check_exits(asset, df, i, price)
 
             # self._run_strategy(asset, "squeeze_v15", self.squeeze[asset], df, i, price)  # V15 disabled per Dan
-            self._run_strategy(asset, "candle_v2_3", self.candle[asset], df, i, price)
+            self._run_strategy(asset, "candle_v2_5", self.candle[asset], df, i, price)
             self._tick_signals += 1
 
             # Log equity to Postgres — real equity = slot capital + unrealized PnL on open pos
             if self.bot_id is not None:
                 open_count = sum(1 for pos in self.positions.values() if pos.asset == asset)
-                asset_key = (asset, "candle_v2_3")
+                asset_key = (asset, "candle_v2_5")
                 unrealized = 0.0
                 if asset_key in self.positions:
                     pos = self.positions[asset_key]

@@ -51,10 +51,11 @@ log = logging.getLogger("live")
 # Constants
 # ---------------------------------------------------------------------------
 ASSETS = config.ASSETS
-CAPITAL_PER_ASSET = config.CAPITAL_PER_ASSET
+CAPITAL_PER_ASSET = config.CAPITAL_PER_ASSET  # legacy fallback
 MIN_BARS = 200  # minimum candles needed for indicators
 LOOP_INTERVAL_SEC = 60  # check every minute, act on new hourly candle
 DUST_THRESHOLD_USD = 10.0  # auto-close positions worth less than this
+SIGNAL_INTERVAL_MIN = getattr(config, "SIGNAL_INTERVAL_MIN", 15)
 
 # ---------------------------------------------------------------------------
 # Open position tracker
@@ -232,6 +233,17 @@ class LiveRunner:
         # Track last processed hour to avoid duplicate processing
         self.last_processed_hour: Optional[datetime] = None
 
+        # 15m signal evaluation: track last processed 15m interval
+        self.last_processed_15m: Optional[datetime] = None
+        self.use_15m_signals = getattr(config, "USE_15M_SIGNALS", False)
+
+        # Kraken equity tracking
+        self.use_kraken_equity = getattr(config, "USE_KRAKEN_EQUITY", False)
+        self.kraken_equity: float = config.INITIAL_CAPITAL  # fallback
+
+        # Percentage-based sizing
+        self.use_pct_sizing = getattr(config, "USE_PCT_SIZING", False)
+
         # Tick counters for heartbeat
         self._tick_signals = 0
         self._tick_opened = 0
@@ -244,8 +256,17 @@ class LiveRunner:
         signal.signal(signal.SIGTERM, self._handle_signal)
 
         log.info("=== Live Runner starting (demo=%s) ===", config.DEMO)
-        log.info("Capital: $%.0f ($%.0f per asset)", config.INITIAL_CAPITAL, CAPITAL_PER_ASSET)
+        if self.use_pct_sizing:
+            log.info("Sizing: PCT-based (%.0f%% base, Kraken equity)", getattr(config, "BASE_POSITION_PCT", 0.15) * 100)
+        else:
+            log.info("Capital: $%.0f ($%.0f per asset)", config.INITIAL_CAPITAL, CAPITAL_PER_ASSET)
         log.info("Assets: %s", ASSETS)
+        log.info("15m signals: %s | Kraken equity: %s", self.use_15m_signals, self.use_kraken_equity)
+
+        # Fetch initial equity from Kraken
+        if self.use_kraken_equity or self.use_pct_sizing:
+            self._fetch_kraken_equity()
+            log.info("Initial Kraken equity: $%.2f", self.kraken_equity)
 
         # Sync positions with exchange on startup
         self._sync_positions()
@@ -268,7 +289,10 @@ class LiveRunner:
             try:
                 # Fast check every minute: SL/TP/trailing stop + Kraken reconciliation
                 self._fast_check()
-                # Hourly: full candle analysis + signal generation
+                # 15m signal evaluation (if enabled) or hourly fallback
+                if self.use_15m_signals:
+                    self._tick_15m()
+                # Hourly: full candle refresh + signal generation
                 self._tick()
             except Exception as e:
                 log.exception("Error in main loop tick")
@@ -313,9 +337,30 @@ class LiveRunner:
 
             ccxt_sym = CCXT_SYMBOLS.get(asset.upper(), "")
             if ccxt_sym not in exchange_map:
-                # DB has position, exchange doesn't — mark closed
-                log.warning("SYNC: %s %s position in DB but not on exchange — marking closed", asset, strategy)
-                self.pg.close_trade_by_id(trade_id, "SYNC_CLOSED")
+                # DB has position, exchange doesn't — fetch real fills for PnL
+                log.warning("SYNC: %s %s position in DB but not on exchange — fetching real fills", asset, strategy)
+                exit_price, pnl_usd, pnl_pct = 0.0, 0.0, 0.0
+                try:
+                    recent_trades = self.executor.fetch_my_trades(asset, limit=50)
+                    close_side = "sell" if direction == "LONG" else "buy"
+                    close_fills = [t for t in recent_trades if t["side"] == close_side]
+                    if close_fills:
+                        total_cost = sum(f["price"] * f["amount"] for f in close_fills)
+                        total_amount = sum(f["amount"] for f in close_fills)
+                        exit_price = total_cost / total_amount if total_amount > 0 else entry
+                        if direction == "LONG":
+                            pnl_pct = (exit_price - entry) / entry * 100 if entry > 0 else 0
+                        else:
+                            pnl_pct = (entry - exit_price) / entry * 100 if entry > 0 else 0
+                        pnl_usd = (pnl_pct / 100) * size_usd * (leverage or 1.0)
+                        log.info("SYNC: %s real exit=$%.4f pnl=$%.2f (%.2f%%)", asset, exit_price, pnl_usd, pnl_pct)
+                except Exception as e:
+                    log.warning("SYNC: Failed to fetch fills for %s: %s", asset, str(e)[:100])
+                    alert_error("RECONCILE_FAIL", f"Sync: cannot fetch fills for {asset}")
+                self.pg.close_trade_by_id(
+                    trade_id, "SYNC_CLOSED",
+                    exit_price=exit_price, pnl_usd=pnl_usd, pnl_pct=pnl_pct,
+                )
                 continue
 
             # Exchange has this position — load it into self.positions
@@ -386,32 +431,214 @@ class LiveRunner:
             log.info("SYNC: No open positions")
 
     def _reconcile_exchange(self):
-        """Check Kraken positions every cycle — close any bot positions that Kraken closed."""
+        """Check Kraken positions every cycle — close any bot positions that Kraken closed.
+
+        When a position is gone from Kraken, fetch actual fill trades to compute
+        real exit price and PnL instead of using $0 placeholders.
+        Also reconcile size mismatches (Postgres vs Kraken).
+        """
         try:
             exchange_positions = self.executor.get_positions()
-        except Exception:
+        except Exception as e:
             log.warning("Failed to fetch exchange positions for reconciliation")
+            alert_error("RECONCILE_FAIL", f"Cannot fetch positions: {str(e)[:150]}")
             return
 
-        exchange_symbols = set()
+        # Build map: ccxt_symbol -> position dict (with size)
+        exchange_map = {}  # type: dict[str, dict]
         for ep in exchange_positions:
-            exchange_symbols.add(ep["symbol"])
+            exchange_map[ep["symbol"]] = ep
 
         keys_to_close = []
         for key, pos in self.positions.items():
             ccxt_sym = CCXT_SYMBOLS.get(pos.asset.upper(), "")
-            if ccxt_sym and ccxt_sym not in exchange_symbols:
-                # Bot thinks position is open, but Kraken closed it (SL/TP hit on exchange)
-                log.warning("RECONCILE: %s %s position gone from exchange — marking closed",
+            if not ccxt_sym:
+                continue
+
+            if ccxt_sym not in exchange_map:
+                # Position gone from exchange — fetch real fill data
+                log.warning("RECONCILE: %s %s position gone from exchange — fetching real fills",
                             pos.asset, pos.strategy)
-                price = pos.trade.entry_price  # best we have without exchange fill price
+                exit_price, pnl_usd, pnl_pct = self._fetch_real_close_data(pos)
+
                 if pos.trade_id is not None:
-                    self.pg.log_trade_close(pos.trade_id, price, "EXCHANGE_CLOSED", 0.0, 0.0)
+                    self.pg.log_trade_close(
+                        pos.trade_id, exit_price, "EXCHANGE_CLOSED", pnl_usd, pnl_pct,
+                    )
+                log.info(
+                    "RECONCILE: %s %s closed — exit=$%.4f pnl=$%.2f (%.2f%%)",
+                    pos.asset, pos.strategy, exit_price, pnl_usd, pnl_pct,
+                )
                 keys_to_close.append(key)
                 self._tick_closed += 1
+            else:
+                # Position still open — reconcile size mismatch
+                ep = exchange_map[ccxt_sym]
+                exchange_size_contracts = ep["size"]
+                our_size_contracts = (
+                    pos.trade.size_usd / pos.trade.entry_price
+                    if pos.trade.entry_price > 0 else 0
+                )
+                if our_size_contracts > 0 and abs(exchange_size_contracts - our_size_contracts) / our_size_contracts > 0.05:
+                    # >5% size mismatch — update to match Kraken
+                    real_size_usd = exchange_size_contracts * ep["entry_price"]
+                    log.warning(
+                        "RECONCILE: %s %s size mismatch — ours=%.4f kraken=%.4f contracts, updating to $%.2f",
+                        pos.asset, pos.strategy, our_size_contracts, exchange_size_contracts, real_size_usd,
+                    )
+                    pos.trade.size_usd = real_size_usd
+                    if pos.trade_id is not None:
+                        self.pg.update_trade_size(pos.trade_id, real_size_usd)
 
         for k in keys_to_close:
             del self.positions[k]
+
+    def _fetch_real_close_data(self, pos: LivePosition):
+        """Fetch recent trades from Kraken to get actual exit price and PnL.
+
+        Returns (exit_price, pnl_usd, pnl_pct).
+        Falls back to entry_price with $0 PnL if trades can't be fetched.
+        """
+        trade = pos.trade
+        try:
+            # Fetch last 50 trades for this symbol
+            recent_trades = self.executor.fetch_my_trades(
+                pos.asset,
+                since=int(trade.entry_time.timestamp() * 1000) if hasattr(trade.entry_time, 'timestamp') else None,
+                limit=50,
+            )
+            if not recent_trades:
+                log.warning("RECONCILE: No trades found for %s — using entry price as fallback", pos.asset)
+                return trade.entry_price, 0.0, 0.0
+
+            # Find the closing trade(s): opposite side from our direction
+            close_side = "sell" if trade.direction == "LONG" else "buy"
+            close_fills = [t for t in recent_trades if t["side"] == close_side]
+
+            if not close_fills:
+                log.warning("RECONCILE: No close-side fills for %s — using last trade price", pos.asset)
+                exit_price = recent_trades[-1]["price"]
+            else:
+                # VWAP of close fills
+                total_cost = sum(f["price"] * f["amount"] for f in close_fills)
+                total_amount = sum(f["amount"] for f in close_fills)
+                exit_price = total_cost / total_amount if total_amount > 0 else close_fills[-1]["price"]
+
+            # Calculate real PnL
+            if trade.direction == "LONG":
+                pnl_pct = (exit_price - trade.entry_price) / trade.entry_price if trade.entry_price > 0 else 0
+            else:
+                pnl_pct = (trade.entry_price - exit_price) / trade.entry_price if trade.entry_price > 0 else 0
+            pnl_usd = pnl_pct * trade.size_usd * trade.leverage
+            return exit_price, pnl_usd, pnl_pct * 100
+
+        except Exception as e:
+            log.warning("RECONCILE: Failed to fetch real fills for %s: %s", pos.asset, str(e)[:100])
+            alert_error("RECONCILE_FAIL", f"Cannot fetch fills for {pos.asset}: {str(e)[:100]}")
+            return trade.entry_price, 0.0, 0.0
+
+    def _fetch_kraken_equity(self) -> float:
+        """Fetch real equity from Kraken balance. Falls back to cached value on error."""
+        if not self.use_kraken_equity:
+            # Legacy: estimate from positions
+            total = 0.0
+            for asset in ASSETS:
+                asset_pnl = 0.0
+                if asset in self.candle_cache and len(self.candle_cache[asset]) > 0:
+                    price = float(self.candle_cache[asset].iloc[-1]["close"])
+                    for pos in self.positions.values():
+                        if pos.asset == asset:
+                            trade = pos.trade
+                            if trade.direction == "LONG":
+                                pnl_pct = (price - trade.entry_price) / trade.entry_price if trade.entry_price > 0 else 0
+                            else:
+                                pnl_pct = (trade.entry_price - price) / trade.entry_price if trade.entry_price > 0 else 0
+                            asset_pnl += pnl_pct * trade.size_usd * trade.leverage
+                total += CAPITAL_PER_ASSET + asset_pnl
+            return total
+        try:
+            balance = self.executor.get_balance()
+            # Kraken Futures: use USD total (includes margin + unrealized)
+            equity = balance.get("USD_total", 0.0)
+            if equity <= 0:
+                # Try free as fallback
+                equity = balance.get("USD", 0.0)
+            if equity > 0:
+                self.kraken_equity = equity
+                log.info("EQUITY: Kraken balance = $%.2f", equity)
+            else:
+                log.warning("EQUITY: Kraken returned $0 — using cached $%.2f", self.kraken_equity)
+            return self.kraken_equity
+        except Exception as e:
+            log.warning("EQUITY: Failed to fetch Kraken balance: %s — using cached $%.2f", str(e)[:100], self.kraken_equity)
+            alert_error("BALANCE_FETCH_FAIL", f"Cannot fetch balance: {str(e)[:100]}")
+            return self.kraken_equity
+
+    def _pct_size_position(
+        self, sig: dict, price: float, direction: str, regime_state, leverage: float,
+    ) -> float:
+        """Percentage-based position sizing from Kraken equity.
+
+        Returns size_usd or 0 to skip.
+        """
+        equity = self.kraken_equity
+        if equity <= 0:
+            return 0.0
+
+        # Base: equity * BASE_POSITION_PCT
+        base_pct = getattr(config, "BASE_POSITION_PCT", 0.15)
+        size_usd = equity * base_pct
+
+        # Score multiplier
+        score = sig.get("score", 3)
+        if score <= 2:
+            size_usd *= getattr(config, "SCORE_MULT_LOW", 0.7)
+        elif score == 3:
+            size_usd *= getattr(config, "SCORE_MULT_MID", 1.0)
+        else:
+            size_usd *= getattr(config, "SCORE_MULT_HIGH", 1.3)
+
+        # Regime multiplier
+        regime = getattr(regime_state, "regime", "NEUTRAL")
+        if regime in ("TRENDING_UP", "TRENDING_DOWN"):
+            # Aligned = trend direction matches trade direction
+            aligned = (
+                (regime == "TRENDING_UP" and direction == "LONG") or
+                (regime == "TRENDING_DOWN" and direction == "SHORT")
+            )
+            if aligned:
+                size_usd *= getattr(config, "REGIME_MULT_TREND", 1.2)
+            else:
+                size_usd *= getattr(config, "REGIME_MULT_RANGE", 0.8)
+        elif regime == "RANGING":
+            size_usd *= getattr(config, "REGIME_MULT_RANGE", 0.8)
+        elif regime in ("VOLATILE", "HIGH_VOLATILITY"):
+            size_usd *= getattr(config, "REGIME_MULT_VOLATILE", 0.7)
+
+        # Clamp: min/max position
+        min_size = equity * getattr(config, "MIN_POSITION_PCT", 0.03)
+        max_size = equity * getattr(config, "MAX_POSITION_PCT", 0.30)
+        if size_usd < min_size:
+            log.info("PCT_SIZE: %s $%.0f < min $%.0f — skipping", direction, size_usd, min_size)
+            return 0.0
+        size_usd = min(size_usd, max_size)
+
+        # Total exposure cap
+        max_exposure = equity * getattr(config, "MAX_EXPOSURE_PCT", 2.0)
+        current_exposure = sum(
+            pos.trade.size_usd * pos.trade.leverage
+            for pos in self.positions.values()
+        )
+        remaining = max_exposure - current_exposure
+        if remaining <= 0:
+            log.info("PCT_SIZE: Exposure cap reached ($%.0f/$%.0f) — skipping", current_exposure, max_exposure)
+            return 0.0
+        size_usd = min(size_usd, remaining / leverage if leverage > 0 else remaining)
+
+        # Apply leverage
+        size_usd *= leverage
+
+        return round(size_usd, 2)
 
     def _load_initial_data(self):
         """Fetch initial candle history for all assets."""
@@ -527,7 +754,8 @@ class LiveRunner:
                     price = ticker.get("last", 0.0)
                     if price <= 0:
                         continue
-                except Exception:
+                except Exception as e:
+                    alert_error("SIGNAL_FAIL", f"Ticker fetch failed for {asset}: {str(e)[:100]}")
                     continue
 
                 trade = pos.trade
@@ -589,8 +817,8 @@ class LiveRunner:
                 if exp.order_id:
                     try:
                         self.executor.cancel_order(exp.order_id, exp.asset)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        alert_error("ORDER_FAIL", f"Cancel expired limit failed {exp.asset}: {str(e)[:100]}")
 
             # Check fills for remaining pending entries
             for asset in ASSETS:
@@ -607,7 +835,8 @@ class LiveRunner:
                         low = ticker.get("low", price)
                         if price <= 0:
                             continue
-                    except Exception:
+                    except Exception as e:
+                        alert_error("SIGNAL_FAIL", f"Smart entry ticker failed {asset}: {str(e)[:100]}")
                         continue
 
                     filled = self.entry_optimizer.check_fill(
@@ -620,6 +849,94 @@ class LiveRunner:
                             asset, strat_name, filled.signal,
                             filled.limit_price, filled.direction,
                         )
+
+    def _tick_15m(self):
+        """15-minute signal evaluation: fetch 15m candles for entry timing,
+        use cached hourly candles for trend confirmation (MTF)."""
+        now = datetime.now(timezone.utc)
+        interval_min = SIGNAL_INTERVAL_MIN
+        # Round down to nearest interval
+        current_slot = now.replace(
+            minute=(now.minute // interval_min) * interval_min,
+            second=0, microsecond=0,
+        )
+
+        # Don't process same slot twice
+        if self.last_processed_15m and self.last_processed_15m >= current_slot:
+            return
+        # Wait 30s after slot boundary for candle finalization
+        if now.minute % interval_min == 0 and now.second < 30:
+            return
+
+        # Skip if this is an hourly boundary (handled by _tick)
+        if current_slot.minute == 0:
+            return
+
+        log.info("--- 15m signal check: %s ---", current_slot.isoformat())
+        self.last_processed_15m = current_slot
+
+        for asset in ASSETS:
+            if asset not in self.candle_cache:
+                continue
+            df_hourly = self.candle_cache[asset]
+            if len(df_hourly) < MIN_BARS:
+                continue
+
+            # Fetch fresh 15m candles for entry timing
+            try:
+                df_15m = self.feed.get_candles(asset, "15m")
+                if len(df_15m) < 20:
+                    continue
+            except Exception as e:
+                log.warning("15M: Failed to fetch %s 15m candles: %s", asset, str(e)[:80])
+                alert_error("SIGNAL_FAIL", f"15m candle fetch failed for {asset}")
+                continue
+
+            i_15m = len(df_15m) - 1
+            price = float(df_15m.iloc[i_15m]["close"])
+
+            # Check exits on 15m close (wick guard uses 15m close)
+            keys_to_close = []
+            for key, pos in self.positions.items():
+                if pos.asset != asset:
+                    continue
+                trade = pos.trade
+                exit_reason = None
+
+                # TP check
+                if trade.direction == "LONG" and trade.target_price > 0 and price >= trade.target_price:
+                    exit_reason = "TARGET"
+                elif trade.direction == "SHORT" and trade.target_price > 0 and price <= trade.target_price:
+                    exit_reason = "TARGET"
+
+                # Wick-resistant stop on 15m close
+                if exit_reason is None:
+                    pos_key_str = f"{asset}_{pos.strategy}"
+                    if trade.direction == "LONG" and price <= trade.stop_price:
+                        if self.wick_guard.should_trigger_stop(
+                            pos_key_str, trade.direction, trade.stop_price, price
+                        ):
+                            exit_reason = "STOP"
+                    elif trade.direction == "SHORT" and price >= trade.stop_price:
+                        if self.wick_guard.should_trigger_stop(
+                            pos_key_str, trade.direction, trade.stop_price, price
+                        ):
+                            exit_reason = "STOP"
+
+                if exit_reason:
+                    log.info("15M_CHECK: %s %s %s triggered %s at $%.4f",
+                             asset, trade.direction, pos.strategy, exit_reason, price)
+                    self._close_position(key, pos, price, exit_reason)
+                    keys_to_close.append(key)
+                    self.wick_guard.clear(f"{asset}_{pos.strategy}")
+
+            for k in keys_to_close:
+                del self.positions[k]
+
+            # Generate signals from 15m candles with hourly MTF confirmation
+            i_hourly = len(df_hourly) - 1
+            self._run_strategy(asset, "candle_v2_3", self.candle[asset], df_hourly, i_hourly, price)
+            self._tick_signals += 1
 
     def _tick(self):
         """Hourly iteration: fetch new candle, run strategies, manage positions."""
@@ -679,38 +996,14 @@ class LiveRunner:
             self._run_strategy(asset, "candle_v2_3", self.candle[asset], df, i, price)
             self._tick_signals += 1
 
-            # Log equity to Postgres (with real unrealized P&L)
-            if self.bot_id is not None:
-                open_count = 0
-                unrealized_pnl = 0.0
-                for pos in self.positions.values():
-                    if pos.asset == asset:
-                        open_count += 1
-                        trade = pos.trade
-                        if trade.direction == "LONG":
-                            pnl_pct = (price - trade.entry_price) / trade.entry_price if trade.entry_price > 0 else 0
-                        else:
-                            pnl_pct = (trade.entry_price - price) / trade.entry_price if trade.entry_price > 0 else 0
-                        unrealized_pnl += pnl_pct * trade.size_usd * trade.leverage
-                asset_equity = CAPITAL_PER_ASSET + unrealized_pnl
-                self.pg.log_equity(self.bot_id, asset, asset_equity, unrealized_pnl, open_count)
-
-        # Heartbeat
+        # Log equity — use Kraken balance as source of truth
         if self.bot_id is not None:
-            total_equity = 0.0
-            for asset in ASSETS:
-                asset_pnl = 0.0
-                if asset in self.candle_cache and len(self.candle_cache[asset]) > 0:
-                    price = float(self.candle_cache[asset].iloc[-1]["close"])
-                    for pos in self.positions.values():
-                        if pos.asset == asset:
-                            trade = pos.trade
-                            if trade.direction == "LONG":
-                                pnl_pct = (price - trade.entry_price) / trade.entry_price if trade.entry_price > 0 else 0
-                            else:
-                                pnl_pct = (trade.entry_price - price) / trade.entry_price if trade.entry_price > 0 else 0
-                            asset_pnl += pnl_pct * trade.size_usd * trade.leverage
-                total_equity += CAPITAL_PER_ASSET + asset_pnl
+            total_equity = self._fetch_kraken_equity()
+            self.pg.log_account_equity(
+                self.bot_id, total_equity,
+                total_equity - config.INITIAL_CAPITAL,
+                len(self.positions),
+            )
             self.pg.log_heartbeat(
                 self.bot_id, self._tick_signals,
                 self._tick_opened, self._tick_closed, total_equity,
@@ -815,8 +1108,9 @@ class LiveRunner:
             try:
                 self.executor.cancel_order(oid, pos.asset)
                 log.info("Cancelled %s order %s for %s", label, oid, pos.asset)
-            except Exception:
+            except Exception as e:
                 log.warning("Failed to cancel %s order %s for %s", label, oid, pos.asset, exc_info=True)
+                alert_error("ORDER_FAIL", f"Cancel {label} failed {pos.asset}: {str(e)[:100]}")
         pos.sl_order_id = None
         pos.tp_order_id = None
 
@@ -839,8 +1133,9 @@ class LiveRunner:
                 )
                 pos.sl_order_id = sl_order.get("id", "")
                 log.info("Placed SL order %s for %s @ %.2f", pos.sl_order_id, pos.asset, trade.stop_price)
-            except Exception:
+            except Exception as e:
                 log.warning("Failed to place SL order for %s", pos.asset, exc_info=True)
+                alert_error("ORDER_FAIL", f"SL order failed {pos.asset}: {str(e)[:100]}")
 
         # Take-profit
         if trade.target_price and trade.target_price > 0:
@@ -853,8 +1148,9 @@ class LiveRunner:
                 )
                 pos.tp_order_id = tp_order.get("id", "")
                 log.info("Placed TP order %s for %s @ %.2f", pos.tp_order_id, pos.asset, trade.target_price)
-            except Exception:
+            except Exception as e:
                 log.warning("Failed to place TP order for %s", pos.asset, exc_info=True)
+                alert_error("ORDER_FAIL", f"TP order failed {pos.asset}: {str(e)[:100]}")
 
     def _run_strategy(
         self, asset: str, strat_name: str, strat, df: pd.DataFrame, i: int, price: float
@@ -867,7 +1163,8 @@ class LiveRunner:
             return
 
         # Check risk: drawdown limit
-        if not self.risk_mgr.check_drawdown(asset, CAPITAL_PER_ASSET):
+        equity = self.kraken_equity if self.use_pct_sizing else CAPITAL_PER_ASSET * len(ASSETS)
+        if not self.risk_mgr.check_drawdown(asset, equity / len(ASSETS)):
             if self.bot_id is not None:
                 self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", "DD limit breached")
             return
@@ -904,23 +1201,29 @@ class LiveRunner:
         leverage = sig.get("leverage", 1.0)
         signal_name = sig.get("signal", strat_name)
 
-        # Size position — apply V2.5 multipliers
-        base_capital = CAPITAL_PER_ASSET
-        adaptive_mult = self.adaptive_sizer.get_multiplier(direction)
-        regime_dir_mult = regime_state.direction_multiplier(direction)
-        vol_mult = regime_state.volatility_multiplier
-        combined_mult = adaptive_mult * regime_dir_mult * vol_mult
+        # ─── Position sizing ───
+        if self.use_pct_sizing:
+            size_usd = self._pct_size_position(
+                sig, price, direction, regime_state, leverage,
+            )
+        else:
+            # Legacy: fixed CAPITAL_PER_ASSET sizing
+            base_capital = CAPITAL_PER_ASSET
+            adaptive_mult = self.adaptive_sizer.get_multiplier(direction)
+            regime_dir_mult = regime_state.direction_multiplier(direction)
+            vol_mult = regime_state.volatility_multiplier
+            combined_mult = adaptive_mult * regime_dir_mult * vol_mult
 
-        # V2.6: Regime sizing multiplier
-        if self.use_regime_sizing:
-            regime_size_mult = regime_state.regime_size_multiplier(direction)
-            combined_mult *= regime_size_mult
+            # V2.6: Regime sizing multiplier
+            if self.use_regime_sizing:
+                regime_size_mult = regime_state.regime_size_multiplier(direction)
+                combined_mult *= regime_size_mult
 
-        # Clamp total multiplier: 0.2x - 2.5x
-        combined_mult = max(0.2, min(2.5, combined_mult))
-        adjusted_capital = base_capital * combined_mult
+            # Clamp total multiplier: 0.2x - 2.5x
+            combined_mult = max(0.2, min(2.5, combined_mult))
+            adjusted_capital = base_capital * combined_mult
 
-        size_usd = size_position(sig, price, self.risk_mgr, adjusted_capital)
+            size_usd = size_position(sig, price, self.risk_mgr, adjusted_capital)
         if size_usd <= 0:
             if self.bot_id is not None:
                 self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", f"Size=0 for {signal_name}")
@@ -957,8 +1260,9 @@ class LiveRunner:
                         "SMART_ENTRY: %s %s %s limit @ $%.4f (pullback from $%.4f)",
                         asset, direction, strat_name, limit_price, price,
                     )
-                except Exception:
+                except Exception as e:
                     log.exception("Failed to place limit order for %s", asset)
+                    alert_error("ORDER_FAIL", f"Limit order failed {asset}: {str(e)[:100]}")
                     self.entry_optimizer.cancel_pending(asset, strat_name)
 
                 if self.bot_id is not None:
@@ -988,7 +1292,20 @@ class LiveRunner:
 
         # If no pre-computed size, compute now
         if size_usd <= 0:
-            size_usd = size_position(sig, entry_price, self.risk_mgr, CAPITAL_PER_ASSET)
+            if self.use_pct_sizing:
+                regime_state = self.regime_detector.detect(
+                    self.candle_cache.get(asset, pd.DataFrame()),
+                    len(self.candle_cache.get(asset, pd.DataFrame())) - 1,
+                ) if asset in self.candle_cache and len(self.candle_cache.get(asset, pd.DataFrame())) > 0 else None
+                if regime_state is not None:
+                    size_usd = self._pct_size_position(
+                        sig, entry_price, direction, regime_state,
+                        sig.get("leverage", 1.0),
+                    )
+                else:
+                    size_usd = self.kraken_equity * getattr(config, "BASE_POSITION_PCT", 0.15)
+            else:
+                size_usd = size_position(sig, entry_price, self.risk_mgr, CAPITAL_PER_ASSET)
         if size_usd <= 0:
             return
 

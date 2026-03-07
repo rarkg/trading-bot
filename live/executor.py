@@ -200,6 +200,30 @@ class KrakenExecutor:
             })
         return positions
 
+    def fetch_my_trades(
+        self,
+        symbol: str,
+        since: Optional[int] = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Fetch recent fills/trades for a symbol from Kraken.
+
+        Returns list of dicts with: price, amount, side, timestamp, cost.
+        """
+        ccxt_symbol = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")
+        raw_trades = self.client.exchange.fetch_my_trades(ccxt_symbol, since=since, limit=limit)
+        result = []
+        for t in raw_trades:
+            result.append({
+                "id": t.get("id", ""),
+                "price": float(t.get("price", 0)),
+                "amount": float(t.get("amount", 0)),
+                "side": t.get("side", ""),
+                "timestamp": t.get("timestamp", 0),
+                "cost": float(t.get("cost", 0)),
+            })
+        return result
+
     def get_balance(self) -> dict[str, float]:
         """Get account balances.
 

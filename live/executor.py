@@ -69,6 +69,20 @@ class KrakenExecutor:
             reduce_only=reduce_only,
         )
 
+    def _format_price(self, symbol: str, price: float) -> float:
+        """Round price to exchange-required precision for the symbol."""
+        ccxt_symbol = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")
+        try:
+            return float(self.client.exchange.price_to_precision(ccxt_symbol, price))
+        except Exception:
+            # Fallback: round to 8 significant figures
+            if price == 0:
+                return 0.0
+            import math
+            magnitude = math.floor(math.log10(abs(price)))
+            factor = 10 ** (7 - magnitude)
+            return round(price * factor) / factor
+
     def place_stop_order(
         self,
         symbol: str,
@@ -87,7 +101,8 @@ class KrakenExecutor:
             reduce_only: Default True (safety — only reduces position).
         """
         ccxt_symbol = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")
-        params = {"stopPrice": stop_price, "reduceOnly": reduce_only}
+        formatted_price = self._format_price(symbol, stop_price)
+        params = {"stopPrice": formatted_price, "reduceOnly": reduce_only}
         return self.client.exchange.create_order(
             symbol=ccxt_symbol,
             type="stop",
@@ -115,7 +130,8 @@ class KrakenExecutor:
             reduce_only: Default True.
         """
         ccxt_symbol = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")
-        params = {"stopPrice": tp_price, "reduceOnly": reduce_only}
+        formatted_price = self._format_price(symbol, tp_price)
+        params = {"stopPrice": formatted_price, "reduceOnly": reduce_only}
         return self.client.exchange.create_order(
             symbol=ccxt_symbol,
             type="takeProfit",

@@ -31,6 +31,8 @@ from live.risk import RiskManager
 from live.pg_writer import PgWriter
 from live import config
 from live.exchange.kraken import CCXT_SYMBOLS
+from live.adaptive_sizer import AdaptiveSizer
+from live.regime import RegimeDetector
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -166,6 +168,14 @@ class LiveRunner:
         # Strategies: one per asset per strategy type
         self.squeeze = make_squeeze_strategies()
         self.candle = make_candle_strategies()
+
+        # V2.5: Adaptive sizing + regime detection (disabled by default)
+        self.adaptive_sizer = AdaptiveSizer(
+            enabled=getattr(config, "USE_ADAPTIVE_SIZING", False),
+        )
+        self.regime_detector = RegimeDetector(
+            enabled=getattr(config, "USE_REGIME_DETECTION", False),
+        )
 
         # Open positions: key = (asset, strategy_name)
         self.positions: dict[tuple[str, str], LivePosition] = {}
@@ -481,6 +491,9 @@ class LiveRunner:
 
         self._tick_closed += 1
 
+        # V2.5: Feed to adaptive sizer
+        self.adaptive_sizer.record_trade(trade.direction, pnl_pct)
+
         # Report to strategy's adaptive manager
         if pos.strategy == "squeeze_v15":
             self.squeeze[pos.asset].record_trade(trade.direction, pnl_pct * 100, exit_reason)
@@ -553,8 +566,14 @@ class LiveRunner:
                 self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", "DD limit breached")
             return
 
+        # V2.5: Regime detection for score adjustment
+        regime_state = self.regime_detector.detect(df, i)
+        regime_adj = None  # type: ignore
+        if self.regime_detector.enabled:
+            regime_adj = lambda d: self.regime_detector.get_score_adjustment(regime_state, d)
+
         # Generate signal
-        sig = strat.generate_signal(df, i)
+        sig = strat.generate_signal(df, i, regime_score_adj=regime_adj)
         if sig is None:
             return
 
@@ -579,8 +598,17 @@ class LiveRunner:
         leverage = sig.get("leverage", 1.0)
         signal_name = sig.get("signal", strat_name)
 
-        # Size position
-        size_usd = size_position(sig, price, self.risk_mgr, CAPITAL_PER_ASSET)
+        # Size position — apply V2.5 multipliers
+        base_capital = CAPITAL_PER_ASSET
+        adaptive_mult = self.adaptive_sizer.get_multiplier(direction)
+        regime_dir_mult = regime_state.direction_multiplier(direction)
+        vol_mult = regime_state.volatility_multiplier
+        combined_mult = adaptive_mult * regime_dir_mult * vol_mult
+        # Clamp total multiplier: 0.2x - 2.5x
+        combined_mult = max(0.2, min(2.5, combined_mult))
+        adjusted_capital = base_capital * combined_mult
+
+        size_usd = size_position(sig, price, self.risk_mgr, adjusted_capital)
         if size_usd <= 0:
             if self.bot_id is not None:
                 self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", f"Size=0 for {signal_name}")

@@ -121,6 +121,21 @@ class CandleV2_3:
                  # Previous candle confirmation
                  use_prev_candle=False,
                  prev_candle_same_dir=False,  # Require prev candle same direction
+                 # === V2.4 NEW params ===
+                 # Trailing stop
+                 use_trailing_stop=False,
+                 trail_activation_atr=1.5,   # Start trailing after 1.5 ATR profit
+                 trail_distance_atr=1.0,     # Trail 1.0 ATR behind best price
+                 # Score-based position sizing
+                 use_score_sizing=False,
+                 score_size_tiers=None,       # [(min_score, multiplier), ...]
+                 # Correlation guard (checked in runner/run_live, not here)
+                 use_correlation_guard=False,
+                 max_same_direction=3,
+                 # Partial profit taking
+                 use_partial_tp=False,
+                 partial_tp_atr=2.0,          # Take partial at 2 ATR profit
+                 partial_tp_pct=0.5,          # Close 50% of position
                  ):
         # Pattern set
         if pattern_set == "marubozu":
@@ -209,6 +224,18 @@ class CandleV2_3:
         self.good_hours = good_hours if good_hours is not None else list(range(24))
         self.use_prev_candle = use_prev_candle
         self.prev_candle_same_dir = prev_candle_same_dir
+
+        # V2.4 params
+        self.use_trailing_stop = use_trailing_stop
+        self.trail_activation_atr = trail_activation_atr
+        self.trail_distance_atr = trail_distance_atr
+        self.use_score_sizing = use_score_sizing
+        self.score_size_tiers = score_size_tiers if score_size_tiers is not None else [(2, 1.0), (4, 1.5), (6, 2.0)]
+        self.use_correlation_guard = use_correlation_guard
+        self.max_same_direction = max_same_direction
+        self.use_partial_tp = use_partial_tp
+        self.partial_tp_atr = partial_tp_atr
+        self.partial_tp_pct = partial_tp_pct
 
         self._indicators = {}
         self._last_data_id = None
@@ -789,7 +816,7 @@ class CandleV2_3:
 
         self._bars_in_trade = 0
 
-        return {
+        sig = {
             "action": best_signal,
             "stop": stop,
             "target": target,
@@ -798,12 +825,77 @@ class CandleV2_3:
             "market_regime": "CANDLE_V2_3",
             "rsi_at_entry": float(ind.get("rsi", np.array([np.nan]))[min(i, len(ind.get("rsi", [0])) - 1)]) if self.use_rsi and "rsi" in ind else None,
             "atr_at_entry": float(atr),
+            "score": best_score,
         }
+
+        # V2.4: Score-based position sizing
+        if self.use_score_sizing:
+            multiplier = 1.0
+            for min_s, mult in sorted(self.score_size_tiers):
+                if best_score >= min_s:
+                    multiplier = mult
+            sig["size_multiplier"] = multiplier
+
+        return sig
 
     def check_exit(self, data, i, open_trade):
         self._compute_indicators(data, i)
         self._bars_in_trade += 1
 
+        atr = self._indicators["atr"][i]
+        high = float(data.iloc[i]["high"])
+        low = float(data.iloc[i]["low"])
+
+        # V2.4: Trailing stop — update stop_price for next bar's engine check
+        if self.use_trailing_stop and not np.isnan(atr) and atr > 0:
+            if not hasattr(open_trade, '_best_price'):
+                open_trade._best_price = None
+
+            if open_trade.direction == "LONG":
+                if open_trade._best_price is None:
+                    open_trade._best_price = high
+                open_trade._best_price = max(open_trade._best_price, high)
+                profit_atr = (open_trade._best_price - open_trade.entry_price) / atr
+                if profit_atr >= self.trail_activation_atr:
+                    new_stop = open_trade._best_price - self.trail_distance_atr * atr
+                    if new_stop > open_trade.stop_price:
+                        open_trade.stop_price = new_stop
+            else:
+                if open_trade._best_price is None:
+                    open_trade._best_price = low
+                open_trade._best_price = min(open_trade._best_price, low)
+                profit_atr = (open_trade.entry_price - open_trade._best_price) / atr
+                if profit_atr >= self.trail_activation_atr:
+                    new_stop = open_trade._best_price + self.trail_distance_atr * atr
+                    if new_stop < open_trade.stop_price:
+                        open_trade.stop_price = new_stop
+
+        # V2.4: Partial profit taking
+        if self.use_partial_tp:
+            entry_atr = getattr(open_trade, 'atr_at_entry', None)
+            if entry_atr and entry_atr > 0:
+                if not hasattr(open_trade, '_partial_taken'):
+                    open_trade._partial_taken = False
+
+                if not open_trade._partial_taken:
+                    if open_trade.direction == "LONG":
+                        tp_price = open_trade.entry_price + self.partial_tp_atr * entry_atr
+                        triggered = high >= tp_price
+                    else:
+                        tp_price = open_trade.entry_price - self.partial_tp_atr * entry_atr
+                        triggered = low <= tp_price
+
+                    if triggered:
+                        open_trade._partial_taken = True
+                        partial_size = open_trade.size_usd * self.partial_tp_pct
+                        open_trade.size_usd -= partial_size
+                        return {
+                            "action": "PARTIAL_TP",
+                            "partial_size": partial_size,
+                            "partial_price": tp_price,
+                        }
+
+        # Time exit
         if self._bars_in_trade >= self.time_exit_bars:
             self._last_exit_bar = i
             return "TIME_EXIT"

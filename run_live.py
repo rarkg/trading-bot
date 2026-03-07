@@ -215,9 +215,16 @@ class LiveRunner:
 
         log.info("Initial data loaded. Entering main loop.")
 
+        self._last_exit_check = datetime.now(timezone.utc)
+
         while not self._shutdown:
             try:
                 self._tick()
+                # Fast exit check every 10 minutes using live price
+                now = datetime.now(timezone.utc)
+                if (now - self._last_exit_check).total_seconds() >= 600:
+                    self._fast_exit_check()
+                    self._last_exit_check = now
             except Exception:
                 log.exception("Error in main loop tick")
             time.sleep(LOOP_INTERVAL_SEC)
@@ -447,6 +454,37 @@ class LiveRunner:
                 self.bot_id, self._tick_signals,
                 self._tick_opened, self._tick_closed, total_equity,
             )
+
+    def _fast_exit_check(self) -> None:
+        """Check exits every 10 minutes using live ticker price (not waiting for new candle)."""
+        if not self.positions:
+            return
+        for key, pos in list(self.positions.items()):
+            try:
+                ccxt_sym = CCXT_SYMBOLS.get(pos.asset.upper(), "")
+                if not ccxt_sym:
+                    continue
+                ticker = self.executor.client.exchange.fetch_ticker(ccxt_sym)
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+                if price <= 0:
+                    continue
+                t = pos.trade
+                ex_r = ex_p = None
+                if t.direction == "LONG":
+                    if price <= t.stop_price:
+                        ex_r, ex_p = "STOP", t.stop_price * (1 - 0.001)
+                    elif price >= t.target_price:
+                        ex_r, ex_p = "TARGET", t.target_price
+                else:
+                    if price >= t.stop_price:
+                        ex_r, ex_p = "STOP", t.stop_price * (1 + 0.001)
+                    elif price <= t.target_price:
+                        ex_r, ex_p = "TARGET", t.target_price
+                if ex_r:
+                    log.info("FAST EXIT: %s %s hit %s at %.6f (live price=%.6f)", pos.asset, t.direction, ex_r, ex_p, price)
+                    self._close_position(key, pos, ex_p, ex_r)
+            except Exception:
+                log.warning("Fast exit check failed for %s", pos.asset, exc_info=True)
 
     def _reconcile_db_with_exchange(self) -> None:
         """Every cycle: close any DB-OPEN trades that no longer exist on Kraken.

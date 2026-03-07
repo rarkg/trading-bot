@@ -109,7 +109,7 @@ def alert_error(category: str, message: str) -> None:
     log.error(alert_text)
     try:
         subprocess.run(
-            ["openclaw", "system-event", "--text", alert_text, "--mode", "now"],
+            ["openclaw", "system", "event", "--text", alert_text, "--mode", "now"],
             timeout=10,
             capture_output=True,
         )

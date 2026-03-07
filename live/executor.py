@@ -1,18 +1,15 @@
-"""KrakenExecutor: places/cancels orders on Kraken Futures.
+"""KrakenExecutor: places/cancels orders on Kraken Futures via ccxt.
 
-Supports both demo and live modes via endpoint selection.
+Supports both demo and live modes via set_sandbox_mode.
 """
 
 from typing import Any, Optional
 
-from live.exchange.kraken import KrakenFuturesClient, FUTURES_SYMBOLS
+from live.exchange.kraken import KrakenFuturesClient, FUTURES_SYMBOLS, CCXT_SYMBOLS
 
 
 class KrakenExecutor:
-    """Executes trades on Kraken Futures.
-
-    Provides a unified interface for order management and position queries.
-    """
+    """Executes trades on Kraken Futures via ccxt."""
 
     def __init__(
         self,
@@ -20,13 +17,6 @@ class KrakenExecutor:
         api_secret: str,
         demo: bool = True,
     ) -> None:
-        """Initialize KrakenExecutor.
-
-        Args:
-            api_key: Kraken Futures API key.
-            api_secret: Kraken Futures API secret (base64-encoded).
-            demo: If True, uses demo-futures.kraken.com. If False, uses live.
-        """
         self.client = KrakenFuturesClient(
             api_key=api_key,
             api_secret=api_secret,
@@ -35,14 +25,7 @@ class KrakenExecutor:
         self.demo = demo
 
     def _resolve_symbol(self, symbol: str) -> str:
-        """Resolve asset name to Kraken futures symbol.
-
-        Args:
-            symbol: Either a futures symbol ("PF_XBTUSD") or asset name ("BTC").
-
-        Returns:
-            Kraken futures symbol string.
-        """
+        """Resolve asset name to Kraken futures symbol."""
         upper = symbol.upper()
         if upper in FUTURES_SYMBOLS:
             return FUTURES_SYMBOLS[upper]
@@ -57,6 +40,7 @@ class KrakenExecutor:
         size: float,
         order_type: str = "mkt",
         price: Optional[float] = None,
+        reduce_only: bool = False,
     ) -> dict[str, Any]:
         """Place an order on Kraken Futures.
 
@@ -66,37 +50,29 @@ class KrakenExecutor:
             size: Position size in contracts.
             order_type: "mkt" (market) or "lmt" (limit).
             price: Limit price. Required for limit orders.
+            reduce_only: If True, only reduces existing position.
 
         Returns:
-            Order response dict with order_id and status.
-
-        Raises:
-            ValueError: If side is invalid or limit order missing price.
+            ccxt order response dict.
         """
         if side.lower() not in ("buy", "sell"):
             raise ValueError(f"Invalid side: {side}. Must be 'buy' or 'sell'")
         if order_type == "lmt" and price is None:
             raise ValueError("Limit orders require a price")
 
-        futures_symbol = self._resolve_symbol(symbol)
         return self.client.send_order(
-            symbol=futures_symbol,
+            symbol=symbol,
             side=side.lower(),
             size=size,
             order_type=order_type,
             price=price,
+            reduce_only=reduce_only,
         )
 
-    def cancel_order(self, order_id: str) -> dict[str, Any]:
-        """Cancel an open order.
-
-        Args:
-            order_id: The order ID to cancel.
-
-        Returns:
-            Cancellation response dict.
-        """
-        return self.client.cancel_order(order_id)
+    def cancel_order(self, order_id: str, symbol: str = "BTC") -> dict[str, Any]:
+        """Cancel an open order."""
+        ccxt_sym = CCXT_SYMBOLS.get(symbol.upper(), "BTC/USD:USD")
+        return self.client.cancel_order(order_id, ccxt_sym)
 
     def get_positions(self) -> list[dict[str, Any]]:
         """Get all open positions.
@@ -104,15 +80,18 @@ class KrakenExecutor:
         Returns:
             List of position dicts with symbol, side, size, entry_price, pnl.
         """
-        resp = self.client.get_open_positions()
+        raw_positions = self.client.get_open_positions()
         positions = []
-        for pos in resp.get("openPositions", []):
+        for pos in raw_positions:
+            size = float(pos.get("contracts", 0) or 0)
+            if size == 0:
+                continue
             positions.append({
                 "symbol": pos.get("symbol", ""),
                 "side": pos.get("side", ""),
-                "size": float(pos.get("size", 0)),
-                "entry_price": float(pos.get("price", 0)),
-                "pnl": float(pos.get("unrealizedFunding", 0)),
+                "size": size,
+                "entry_price": float(pos.get("entryPrice", 0) or 0),
+                "pnl": float(pos.get("unrealizedPnl", 0) or 0),
             })
         return positions
 
@@ -122,9 +101,19 @@ class KrakenExecutor:
         Returns:
             Dict mapping currency to available balance.
         """
-        resp = self.client.get_accounts()
-        balances: dict[str, float] = {}
-        for account in resp.get("accounts", {}).values():
-            currency = account.get("currency", "unknown")
-            balances[currency] = float(account.get("auxiliary", {}).get("af", 0))
-        return balances
+        balance = self.client.get_accounts()
+        result: dict[str, float] = {}
+        if "USD" in balance:
+            usd = balance["USD"]
+            result["USD"] = float(usd.get("free", 0) or 0)
+            result["USD_total"] = float(usd.get("total", 0) or 0)
+        # Also check 'total' and 'free' top-level
+        if "total" in balance:
+            for currency, amount in balance["total"].items():
+                if amount and float(amount) > 0:
+                    result[f"{currency}_total"] = float(amount)
+        if "free" in balance:
+            for currency, amount in balance["free"].items():
+                if amount and float(amount) > 0:
+                    result[f"{currency}_free"] = float(amount)
+        return result

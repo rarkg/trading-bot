@@ -331,6 +331,34 @@ class LiveRunner:
         else:
             log.info("SYNC: No open positions")
 
+    def _reconcile_exchange(self):
+        """Check Kraken positions every cycle — close any bot positions that Kraken closed."""
+        try:
+            exchange_positions = self.executor.get_positions()
+        except Exception:
+            log.warning("Failed to fetch exchange positions for reconciliation")
+            return
+
+        exchange_symbols = set()
+        for ep in exchange_positions:
+            exchange_symbols.add(ep["symbol"])
+
+        keys_to_close = []
+        for key, pos in self.positions.items():
+            ccxt_sym = CCXT_SYMBOLS.get(pos.asset.upper(), "")
+            if ccxt_sym and ccxt_sym not in exchange_symbols:
+                # Bot thinks position is open, but Kraken closed it (SL/TP hit on exchange)
+                log.warning("RECONCILE: %s %s position gone from exchange — marking closed",
+                            pos.asset, pos.strategy)
+                price = pos.trade.entry_price  # best we have without exchange fill price
+                if pos.trade_id is not None:
+                    self.pg.log_trade_close(pos.trade_id, price, "EXCHANGE_CLOSED", 0.0, 0.0)
+                keys_to_close.append(key)
+                self._tick_closed += 1
+
+        for k in keys_to_close:
+            del self.positions[k]
+
     def _load_initial_data(self):
         """Fetch initial candle history for all assets."""
         for asset in ASSETS:
@@ -377,6 +405,9 @@ class LiveRunner:
         self._tick_signals = 0
         self._tick_opened = 0
         self._tick_closed = 0
+
+        # Reconcile with Kraken every cycle (Kraken = source of truth)
+        self._reconcile_exchange()
 
         # Process each asset
         for asset in ASSETS:

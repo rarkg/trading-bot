@@ -407,12 +407,6 @@ class LiveRunner:
             # Check exits on open positions first
             self._check_exits(asset, df, i, price)
 
-            # Generate entry signals only on a NEW candle (dedup by candle timestamp)
-            candle_ts = df.index[i]
-            if self._last_signal_candle.get(asset) == candle_ts:
-                continue  # same candle as last scan — skip entry, exits already checked above
-            self._last_signal_candle[asset] = candle_ts
-
             # self._run_strategy(asset, "squeeze_v15", self.squeeze[asset], df, i, price)  # V15 disabled per Dan
             self._run_strategy(asset, "candle_v2_3", self.candle[asset], df, i, price)
             self._tick_signals += 1

@@ -98,7 +98,7 @@ def make_candle_strategies() -> dict[str, CandleV2_3]:
     strats = {}
     for asset in ASSETS:
         strats[asset] = CandleV2_3(
-            # Config 3: R:R 2:3, score>=2, all indicators, MTF both
+            # V2.4: R:R 2:3, score>=2, trailing stop (1.5/0.5)
             min_score=2,
             stop_atr=2.0,
             target_atr=3.0,
@@ -114,6 +114,10 @@ def make_candle_strategies() -> dict[str, CandleV2_3]:
             cooldown=12,
             time_exit_bars=144,
             base_leverage=2.0,
+            # V2.4 trailing stop
+            use_trailing_stop=True,
+            trail_activation_atr=1.5,
+            trail_distance_atr=0.5,
         )
     return strats
 

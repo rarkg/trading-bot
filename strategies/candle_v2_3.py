@@ -714,7 +714,15 @@ class CandleV2_3:
 
         return score
 
-    def generate_signal(self, data, i):
+    def generate_signal(self, data, i, regime_score_adj=None):
+        """Generate trade signal.
+
+        Args:
+            data: OHLCV DataFrame.
+            i: Current bar index.
+            regime_score_adj: Optional callable(direction) -> int that returns
+                extra min_score required (from RegimeDetector). None = no adjustment.
+        """
         self._compute_indicators(data, i)
 
         if i < 200:
@@ -790,8 +798,13 @@ class CandleV2_3:
                 ] if x)
                 if score < enabled_count * 0.8:
                     continue
-            elif score < self.min_score:
-                continue
+            else:
+                # V2.5: regime-aware score threshold
+                adj = 0
+                if regime_score_adj is not None:
+                    adj = regime_score_adj(direction)
+                if score < self.min_score + adj:
+                    continue
 
             if score > best_score:
                 best_score = score

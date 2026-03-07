@@ -31,6 +31,8 @@ from live.risk import RiskManager
 from live.pg_writer import PgWriter
 from live import config
 from live.exchange.kraken import CCXT_SYMBOLS
+from live.adaptive_sizer import AdaptiveSizer
+from live.regime import RegimeDetector
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -98,10 +100,10 @@ def make_candle_strategies() -> dict[str, CandleV2_3]:
     strats = {}
     for asset in ASSETS:
         strats[asset] = CandleV2_3(
-            # V2.4: R:R 2:3, score>=2, trailing stop (1.5/0.5)
-            min_score=2,
+            # V2.5: tighter trail, score 1, adx 50, R:R 2:4
+            min_score=1,
             stop_atr=2.0,
-            target_atr=3.0,
+            target_atr=4.0,
             use_mtf=True,
             mtf_require="both",
             use_rsi=True, use_stoch_rsi=True, use_williams_r=True,
@@ -110,14 +112,14 @@ def make_candle_strategies() -> dict[str, CandleV2_3]:
             use_keltner=True, use_volume=True, use_mfi=True,
             use_obv_slope=True, use_range_position=True, use_hh_ll=True,
             pattern_set="top5",
-            adx_max=40,
+            adx_max=50,
             cooldown=12,
             time_exit_bars=144,
             base_leverage=2.0,
-            # V2.4 trailing stop
+            # V2.5 trailing stop (tighter trail)
             use_trailing_stop=True,
             trail_activation_atr=1.5,
-            trail_distance_atr=0.5,
+            trail_distance_atr=0.3,
         )
     return strats
 
@@ -166,6 +168,14 @@ class LiveRunner:
         # Strategies: one per asset per strategy type
         self.squeeze = make_squeeze_strategies()
         self.candle = make_candle_strategies()
+
+        # V2.5: Adaptive sizing + regime detection (disabled by default)
+        self.adaptive_sizer = AdaptiveSizer(
+            enabled=getattr(config, "USE_ADAPTIVE_SIZING", False),
+        )
+        self.regime_detector = RegimeDetector(
+            enabled=getattr(config, "USE_REGIME_DETECTION", False),
+        )
 
         # Open positions: key = (asset, strategy_name)
         self.positions: dict[tuple[str, str], LivePosition] = {}
@@ -481,6 +491,9 @@ class LiveRunner:
 
         self._tick_closed += 1
 
+        # V2.5: Feed to adaptive sizer
+        self.adaptive_sizer.record_trade(trade.direction, pnl_pct)
+
         # Report to strategy's adaptive manager
         if pos.strategy == "squeeze_v15":
             self.squeeze[pos.asset].record_trade(trade.direction, pnl_pct * 100, exit_reason)
@@ -553,8 +566,14 @@ class LiveRunner:
                 self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", "DD limit breached")
             return
 
+        # V2.5: Regime detection for score adjustment
+        regime_state = self.regime_detector.detect(df, i)
+        regime_adj = None  # type: ignore
+        if self.regime_detector.enabled:
+            regime_adj = lambda d: self.regime_detector.get_score_adjustment(regime_state, d)
+
         # Generate signal
-        sig = strat.generate_signal(df, i)
+        sig = strat.generate_signal(df, i, regime_score_adj=regime_adj)
         if sig is None:
             return
 
@@ -579,8 +598,17 @@ class LiveRunner:
         leverage = sig.get("leverage", 1.0)
         signal_name = sig.get("signal", strat_name)
 
-        # Size position
-        size_usd = size_position(sig, price, self.risk_mgr, CAPITAL_PER_ASSET)
+        # Size position — apply V2.5 multipliers
+        base_capital = CAPITAL_PER_ASSET
+        adaptive_mult = self.adaptive_sizer.get_multiplier(direction)
+        regime_dir_mult = regime_state.direction_multiplier(direction)
+        vol_mult = regime_state.volatility_multiplier
+        combined_mult = adaptive_mult * regime_dir_mult * vol_mult
+        # Clamp total multiplier: 0.2x - 2.5x
+        combined_mult = max(0.2, min(2.5, combined_mult))
+        adjusted_capital = base_capital * combined_mult
+
+        size_usd = size_position(sig, price, self.risk_mgr, adjusted_capital)
         if size_usd <= 0:
             if self.bot_id is not None:
                 self.pg.log_decision(self.bot_id, asset, strat_name, "SKIP", f"Size=0 for {signal_name}")

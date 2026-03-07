@@ -654,18 +654,9 @@ class LiveRunner:
             price, stop, target, size_usd, leverage,
         )
 
-        # Log as PENDING before placing order
-        trade_id = None  # type: Optional[int]
-        if self.bot_id is not None:
-            trade_id = self.pg.log_trade_open(
-                self.bot_id, asset, strat_name, direction, signal_name,
-                price, stop, target, size_usd, leverage,
-            )
-
         import time as _time
 
         # Place order with retry (up to 3 attempts, 2s apart)
-        order = None
         order_id = ""
         MAX_ORDER_ATTEMPTS = 3
         for attempt in range(1, MAX_ORDER_ATTEMPTS + 1):
@@ -684,9 +675,8 @@ class LiveRunner:
                 if attempt < MAX_ORDER_ATTEMPTS:
                     _time.sleep(2)
                 else:
-                    log.error("All %d order attempts failed for %s %s", MAX_ORDER_ATTEMPTS, asset, strat_name)
-                    if trade_id and self.bot_id is not None:
-                        self.pg.cancel_pending_trade(trade_id, f"Order failed after {MAX_ORDER_ATTEMPTS} attempts: {signal_name}")
+                    log.error("All %d order attempts failed for %s %s — not logging to DB", MAX_ORDER_ATTEMPTS, asset, strat_name)
+                    if self.bot_id is not None:
                         self.pg.log_decision(self.bot_id, asset, strat_name, "ERROR", f"Order failed after {MAX_ORDER_ATTEMPTS} attempts for {signal_name}")
                     return
 
@@ -705,9 +695,7 @@ class LiveRunner:
                     fill_confirmed = True
                     break
                 elif order_status.get("status") == "canceled":
-                    if trade_id and self.bot_id:
-                        self.pg.cancel_pending_trade(trade_id, "Order cancelled by exchange")
-                    log.warning("Order cancelled by exchange for %s %s", asset, strat_name)
+                    log.warning("Order cancelled by exchange for %s %s — not logging to DB", asset, strat_name)
                     return
                 else:
                     log.info("Fill attempt %d/%d: order status=%s, retrying...", attempt, MAX_FILL_ATTEMPTS, order_status.get("status"))
@@ -715,12 +703,19 @@ class LiveRunner:
                 log.warning("Fill confirm attempt %d/%d failed for %s: %s", attempt, MAX_FILL_ATTEMPTS, asset, e)
 
         if not fill_confirmed:
-            log.warning("Could not confirm fill for %s after %d attempts — using signal price $%.4f", asset, MAX_FILL_ATTEMPTS, price)
+            log.warning("Fill unconfirmed for %s after %d attempts — logging with signal price $%.4f", asset, MAX_FILL_ATTEMPTS, price)
 
-        # Confirm trade as OPEN with actual fill price
-        if trade_id:
-            self.pg.confirm_trade_open(trade_id, actual_fill)
-            trade.entry_price = actual_fill  # update trade with real fill
+        # Order succeeded — log to DB as OPEN with actual fill price
+        trade.entry_price = actual_fill
+        trade_id = None  # type: Optional[int]
+        if self.bot_id is not None:
+            trade_id = self.pg.log_trade_open(
+                self.bot_id, asset, strat_name, direction, signal_name,
+                actual_fill, stop, target, size_usd, leverage,
+            )
+            # Immediately confirm as OPEN (skip PENDING state entirely)
+            if trade_id:
+                self.pg.confirm_trade_open(trade_id, actual_fill)
 
         pos = LivePosition(
             trade_id=trade_id,

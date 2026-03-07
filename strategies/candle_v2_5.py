@@ -57,13 +57,13 @@ class CandleV2_5:
                  use_hh_ll=False,
                  pattern_set="top5",
                  hard_filter=False,
-                 min_score=2.0,
+                 min_score=1.0,
                  stop_atr=2.0,
-                 target_atr=3.0,
-                 time_exit_bars=36,
-                 cooldown=8,
+                 target_atr=4.0,
+                 time_exit_bars=144,
+                 cooldown=12,
                  base_leverage=2.0,
-                 adx_max=40,
+                 adx_max=50,
                  direction_filter="both",
                  rsi_period=14,
                  rsi_oversold=30,
@@ -123,9 +123,9 @@ class CandleV2_5:
                  prev_candle_same_dir=False,  # Require prev candle same direction
                  # === V2.4 NEW params ===
                  # Trailing stop
-                 use_trailing_stop=False,
+                 use_trailing_stop=True,
                  trail_activation_atr=1.5,   # Start trailing after 1.5 ATR profit
-                 trail_distance_atr=1.0,     # Trail 1.0 ATR behind best price
+                 trail_distance_atr=0.3,     # Trail 1.0 ATR behind best price
                  # Score-based position sizing
                  use_score_sizing=False,
                  score_size_tiers=None,       # [(min_score, multiplier), ...]

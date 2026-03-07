@@ -60,8 +60,8 @@ class CandleV2_4:
                  min_score=2.0,
                  stop_atr=2.0,
                  target_atr=3.0,
-                 time_exit_bars=36,
-                 cooldown=8,
+                 time_exit_bars=144,
+                 cooldown=12,
                  base_leverage=2.0,
                  adx_max=40,
                  direction_filter="both",
@@ -123,9 +123,9 @@ class CandleV2_4:
                  prev_candle_same_dir=False,  # Require prev candle same direction
                  # === V2.4 NEW params ===
                  # Trailing stop
-                 use_trailing_stop=False,
+                 use_trailing_stop=True,
                  trail_activation_atr=1.5,   # Start trailing after 1.5 ATR profit
-                 trail_distance_atr=1.0,     # Trail 1.0 ATR behind best price
+                 trail_distance_atr=0.5,     # Trail 1.0 ATR behind best price
                  # Score-based position sizing
                  use_score_sizing=False,
                  score_size_tiers=None,       # [(min_score, multiplier), ...]
@@ -142,6 +142,8 @@ class CandleV2_4:
             self.patterns = {"CDLMARUBOZU"}
         elif pattern_set == "marubozu_plus":
             self.patterns = {"CDLMARUBOZU", "CDLCLOSINGMARUBOZU"}
+        elif pattern_set == "all":
+            self.patterns = set(ALL_CDL_PATTERNS)
         else:
             self.patterns = TOP_PATTERNS
 

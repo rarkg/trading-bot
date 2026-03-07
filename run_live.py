@@ -675,9 +675,11 @@ class LiveRunner:
                 if attempt < MAX_ORDER_ATTEMPTS:
                     _time.sleep(2)
                 else:
-                    log.error("All %d order attempts failed for %s %s — not logging to DB", MAX_ORDER_ATTEMPTS, asset, strat_name)
+                    err_msg = str(e)
+                    log.error("All %d order attempts failed for %s %s: %s", MAX_ORDER_ATTEMPTS, asset, strat_name, err_msg)
                     if self.bot_id is not None:
                         self.pg.log_decision(self.bot_id, asset, strat_name, "ERROR", f"Order failed after {MAX_ORDER_ATTEMPTS} attempts for {signal_name}")
+                    send_imsg(f"⚠️ Order failed: {asset} {direction}\nSignal: {signal_name}\nReason: {err_msg}\nAfter {MAX_ORDER_ATTEMPTS} retries — not entered.")
                     return
 
         # Confirm fill — retry up to 3 times with 1s delay
@@ -696,6 +698,7 @@ class LiveRunner:
                     break
                 elif order_status.get("status") == "canceled":
                     log.warning("Order cancelled by exchange for %s %s — not logging to DB", asset, strat_name)
+                    send_imsg(f"⚠️ Order cancelled by exchange: {asset} {direction}\nSignal: {signal_name}\nKraken rejected the order.")
                     return
                 else:
                     log.info("Fill attempt %d/%d: order status=%s, retrying...", attempt, MAX_FILL_ATTEMPTS, order_status.get("status"))

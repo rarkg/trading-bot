@@ -96,12 +96,16 @@ class BacktestEngine:
         # Normalize column names
         data = data.copy()
         data.columns = [c.lower() for c in data.columns]
-        
+
+        # Pre-extract numpy arrays for fast candle access (avoids iloc overhead)
+        closes = data["close"].values.astype(float)
+        highs = data["high"].values.astype(float)
+        lows = data["low"].values.astype(float)
+
         for i in range(20, len(data)):  # Skip first 20 for indicator warmup
-            row = data.iloc[i]
-            price = float(row["close"])
-            high = float(row["high"])
-            low = float(row["low"])
+            price = closes[i]
+            high = highs[i]
+            low = lows[i]
             
             # Check exit conditions on open trade
             if open_trade:

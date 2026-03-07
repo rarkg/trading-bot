@@ -156,8 +156,8 @@ def make_candle_strategies() -> dict[str, CandleV2_3]:
     strats = {}
     for asset in ASSETS:
         strats[asset] = CandleV2_3(
-            # Config 2: R:R 3:2, score>=4, all indicators, MTF both
-            min_score=4,
+            # Config 2: R:R 3:2, score>=2, all indicators, MTF both
+            min_score=2,
             stop_atr=3.0,
             target_atr=2.0,
             use_mtf=True,

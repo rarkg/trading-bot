@@ -448,7 +448,8 @@ class LiveRunner:
             return
         try:
             exchange_positions = self.executor.get_positions()
-            exchange_assets = {p["asset"].upper() for p in exchange_positions if p.get("asset")}
+            # symbol format is "ADA/USD:USD" — extract base asset (e.g. "ADA")
+            exchange_assets = {p["symbol"].split("/")[0].upper() for p in exchange_positions if p.get("symbol")}
 
             db_open = self.pg.get_open_trades(self.bot_id)
             for row in db_open:

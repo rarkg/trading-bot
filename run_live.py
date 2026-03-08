@@ -184,6 +184,11 @@ class LiveRunner:
 
         # Data cache: asset -> DataFrame (accumulated hourly candles)
         self.candle_cache: dict[str, pd.DataFrame] = {}
+        # 15m candle cache (collected but not yet used by strategy)
+        self.candle_cache_15m: dict[str, pd.DataFrame] = {}
+
+        # Assets available for trading on Kraken Futures (validated on startup)
+        self.tradeable_assets: set[str] = set(ASSETS)
 
         # Track last processed hour to avoid duplicate processing
         self.last_processed_hour: Optional[datetime] = None
@@ -207,6 +212,9 @@ class LiveRunner:
 
         # Sync positions with exchange on startup
         self._sync_positions()
+
+        # Validate which assets are available on Kraken Futures
+        self._validate_tradeable_assets()
 
         # Initial data load — get enough history for indicators
         self._load_initial_data()
@@ -420,11 +428,97 @@ class LiveRunner:
         else:
             log.info("SYNC: No open positions")
 
+    def _validate_tradeable_assets(self) -> None:
+        """Check which assets are actually listed on Kraken Futures and prune untradeable ones."""
+        try:
+            markets = self.executor.client.exchange.load_markets()
+            available = set(markets.keys())
+            for asset in list(ASSETS):
+                ccxt_sym = CCXT_SYMBOLS.get(asset, "")
+                if ccxt_sym and ccxt_sym not in available:
+                    log.warning("SKIPPING %s: not available on Kraken Futures", asset)
+                    self.tradeable_assets.discard(asset)
+            log.info("Tradeable assets (%d/%d): %s", len(self.tradeable_assets), len(ASSETS), sorted(self.tradeable_assets))
+        except Exception:
+            log.warning("Failed to validate tradeable assets — trading all by default", exc_info=True)
+            self.tradeable_assets = set(ASSETS)
+
+    def _gap_fill(self, asset: str, timeframe: str = "1h") -> None:
+        """Fetch candles from Kraken since last Postgres timestamp and ingest them."""
+        from live.exchange.kraken import KrakenSpotClient, SPOT_PAIRS
+
+        if asset.upper() not in SPOT_PAIRS:
+            return
+
+        max_ts = self.data_provider.get_max_timestamp(asset, timeframe)
+        if max_ts is None:
+            return  # no data at all — seed_if_empty handles bootstrapping
+
+        # Convert to unix int (max_ts may be a datetime or pd.Timestamp)
+        try:
+            since = int(pd.Timestamp(max_ts).timestamp())
+        except Exception:
+            return
+
+        now_ts = int(time.time())
+        tf_seconds = {"1h": 3600, "15m": 900}
+        tf_sec = tf_seconds.get(timeframe, 3600)
+        if (now_ts - since) < tf_sec * 2:
+            return  # already up to date
+
+        tf_to_minutes = {"1h": 60, "15m": 15, "4h": 240, "1d": 1440}
+        interval_min = tf_to_minutes.get(timeframe, 60)
+        pair = SPOT_PAIRS[asset.upper()]
+        client = KrakenSpotClient()
+        page_size = 720
+        max_iterations = 10
+
+        try:
+            for page in range(1, max_iterations + 1):
+                raw = client.get_ohlc(pair=pair, interval=interval_min, since=since)
+                if not raw:
+                    break
+
+                count = 0
+                last_ts = since
+                for candle in raw:
+                    ts_unix = candle["timestamp"]
+                    if ts_unix > now_ts:
+                        break
+                    self.data_provider.ingest_candle(
+                        asset=asset,
+                        timeframe=timeframe,
+                        timestamp=pd.Timestamp(ts_unix, unit="s", tz="UTC"),
+                        open_=candle["open"],
+                        high=candle["high"],
+                        low=candle["low"],
+                        close=candle["close"],
+                        volume=candle["volume"],
+                    )
+                    last_ts = ts_unix
+                    count += 1
+
+                log.info("Gap-fill %s %s: page %d, fetched %d candles, last_ts=%s",
+                         asset, timeframe, page, count,
+                         pd.Timestamp(last_ts, unit="s", tz="UTC").isoformat())
+
+                if count < page_size:
+                    break  # caught up to current time
+                since = last_ts
+        except Exception:
+            log.warning("Gap-fill failed for %s %s", asset, timeframe, exc_info=True)
+
     def _load_initial_data(self):
-        """Seed Postgres from CSVs (if empty), then load full history for all assets."""
-        log.info("Seeding candle DB from CSV history...")
+        """Seed Postgres from CSVs (if empty), gap-fill, then load full history for all assets."""
+        log.info("Seeding candle DB from CSV/API history...")
         for asset in ASSETS:
             self.data_provider.seed_if_empty(asset, "1h")
+            self.data_provider.seed_if_empty(asset, "15m")
+
+        log.info("Gap-filling candles from Kraken API...")
+        for asset in ASSETS:
+            self._gap_fill(asset, "1h")
+            self._gap_fill(asset, "15m")
 
         log.info("Loading candle history from Postgres...")
         for asset in ASSETS:
@@ -437,6 +531,18 @@ class LiveRunner:
                     log.warning("  %s: no candles returned", asset)
             except Exception:
                 log.exception("  %s: failed to load candles", asset)
+
+        log.info("Loading 15m candle history from Postgres...")
+        for asset in ASSETS:
+            try:
+                df = self.data_provider.get_candles(asset, "15m", limit=35040)
+                if len(df) > 0:
+                    self.candle_cache_15m[asset] = df
+                    log.info("  %s 15m: loaded %d candles", asset, len(df))
+                else:
+                    log.debug("  %s 15m: no candles", asset)
+            except Exception:
+                log.exception("  %s 15m: failed to load candles", asset)
 
     def _tick(self):
         """Single iteration: fetch fresh candles and scan for entries every 10 min."""
@@ -487,6 +593,41 @@ class LiveRunner:
             except Exception:
                 log.exception("Failed to fetch %s candles", asset)
 
+        # Fetch incremental 15m candles (collection only — not used by strategy yet)
+        for asset in ASSETS:
+            try:
+                since_15m = None
+                if asset in self.candle_cache_15m and len(self.candle_cache_15m[asset]) > 0:
+                    last_ts = self.candle_cache_15m[asset].index[-1]
+                    since_15m = int(last_ts.timestamp()) - 1800  # 30min overlap
+
+                new_15m = self.feed.get_candles(asset, "15m", since=since_15m)
+                n_new_15m = len(new_15m)
+
+                if n_new_15m > 0:
+                    for ts, row in new_15m.iterrows():
+                        self.data_provider.ingest_candle(
+                            asset=asset,
+                            timeframe="15m",
+                            timestamp=ts,
+                            open_=float(row["open"]),
+                            high=float(row["high"]),
+                            low=float(row["low"]),
+                            close=float(row["close"]),
+                            volume=float(row["volume"]),
+                        )
+
+                    if asset in self.candle_cache_15m:
+                        combined = pd.concat([self.candle_cache_15m[asset], new_15m])
+                        combined = combined[~combined.index.duplicated(keep="last")]
+                        self.candle_cache_15m[asset] = combined.sort_index()
+                    else:
+                        self.candle_cache_15m[asset] = new_15m
+
+                    log.info("%s 15m: +%d new", asset, n_new_15m)
+            except Exception:
+                log.debug("Failed to fetch %s 15m candles: %s", asset, exc_info=False)
+
         # Wire BTC data for cross-asset
         if "BTC" in self.candle_cache:
             for asset, strat in self.squeeze.items():
@@ -517,8 +658,12 @@ class LiveRunner:
             i = len(df) - 1
             price = float(df.iloc[i]["close"])
 
-            # Check exits on open positions first
+            # Check exits on open positions first (all assets, including non-tradeable)
             self._check_exits(asset, df, i, price)
+
+            # Only open new trades on assets available on Kraken Futures
+            if asset not in self.tradeable_assets:
+                continue
 
             # self._run_strategy(asset, "squeeze_v15", self.squeeze[asset], df, i, price)  # V15 disabled per Dan
             self._run_strategy(asset, "candle_v2_6", self.candle[asset], df, i, price)

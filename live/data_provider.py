@@ -6,10 +6,12 @@ from Kraken REST, Postgres, or CSV files.
 
 import logging
 import os
+import time as _time
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import pandas as pd
+import requests
 
 log = logging.getLogger("live.data")
 
@@ -129,7 +131,7 @@ class PostgresDataProvider(DataProvider):
         return self._conn is not None
 
     def _ensure_table(self) -> None:
-        """Create the candles table if it doesn't exist."""
+        """Create the candles table if it doesn't exist, then try to enable TimescaleDB."""
         if not self._ensure_conn():
             return
         try:
@@ -155,6 +157,34 @@ class PostgresDataProvider(DataProvider):
         except Exception:
             log.warning("Failed to create candles table", exc_info=True)
 
+        # TimescaleDB: try to enable hypertable + compression; graceful fallback if not installed
+        tsdb_active = False
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE")
+            tsdb_active = True
+        except Exception:
+            log.info("TimescaleDB: not available (regular Postgres)")
+            return
+
+        if tsdb_active:
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT create_hypertable('candles', by_range('timestamp'), if_not_exists => TRUE)"
+                    )
+                log.info("TimescaleDB: active (hypertable enabled)")
+            except Exception:
+                log.info("TimescaleDB: hypertable creation skipped (table may already have data or be a hypertable)")
+
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT add_compression_policy('candles', INTERVAL '30 days')"
+                    )
+            except Exception:
+                pass  # compression policy may already exist or TimescaleDB CE limits may apply
+
     def seed_if_empty(self, asset: str, timeframe: str = "1h") -> None:
         """Seed candles from CSV if the table is empty for this asset+timeframe."""
         if not self._ensure_conn():
@@ -177,54 +207,214 @@ class PostgresDataProvider(DataProvider):
 
         # Find CSV file
         suffix = self._CSV_SUFFIXES.get(timeframe)
-        if suffix is None:
-            log.info("  %s %s: no CSV mapping, skipping seed", asset, timeframe)
-            return
+        csv_path = None
+        if suffix is not None:
+            csv_path = os.path.join(self.data_dir, f"{asset.upper()}{suffix}")
 
-        csv_path = os.path.join(self.data_dir, f"{asset.upper()}{suffix}")
-        if not os.path.exists(csv_path):
-            log.info("  %s %s: CSV not found at %s", asset, timeframe, csv_path)
-            return
+        csv_has_data = csv_path is not None and os.path.exists(csv_path)
 
-        # Load CSV and insert
-        try:
-            df = pd.read_csv(csv_path)
-            # Normalize column names (lowercase)
-            df.columns = [c.lower().strip() for c in df.columns]
+        if csv_has_data:
+            # Load CSV and insert
+            try:
+                df = pd.read_csv(csv_path)
+                # Normalize column names (lowercase)
+                df.columns = [c.lower().strip() for c in df.columns]
 
-            # Detect timestamp column
-            ts_col = None
-            for candidate in ["timestamp", "date", "datetime", "time"]:
-                if candidate in df.columns:
-                    ts_col = candidate
-                    break
-            if ts_col is None:
-                log.warning("  %s %s: no timestamp column found in CSV", asset, timeframe)
+                # Detect timestamp column
+                ts_col = None
+                for candidate in ["timestamp", "date", "datetime", "time"]:
+                    if candidate in df.columns:
+                        ts_col = candidate
+                        break
+                if ts_col is None:
+                    log.warning("  %s %s: no timestamp column found in CSV", asset, timeframe)
+                    csv_has_data = False
+                else:
+                    df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+                    if len(df) == 0:
+                        csv_has_data = False
+            except Exception:
+                log.warning("Failed to load CSV for %s %s", asset, timeframe, exc_info=True)
+                csv_has_data = False
+
+            if csv_has_data:
+                inserted = 0
+                with self._conn.cursor() as cur:
+                    for _, row in df.iterrows():
+                        try:
+                            cur.execute(
+                                """INSERT INTO candles (asset, timeframe, timestamp, open, high, low, close, volume)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                   ON CONFLICT (asset, timeframe, timestamp) DO NOTHING""",
+                                (
+                                    asset.upper(), timeframe, row[ts_col],
+                                    float(row["open"]), float(row["high"]),
+                                    float(row["low"]), float(row["close"]),
+                                    float(row.get("volume", 0)),
+                                ),
+                            )
+                            inserted += 1
+                        except Exception:
+                            pass  # skip bad rows
+                log.info("Seeded %s %s from CSV (%d candles)", asset, timeframe, inserted)
                 return
 
-            df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+        # CSV missing or empty — bootstrap from Kraken API
+        log.info("  %s %s: CSV not found, bootstrapping from Kraken API...", asset, timeframe)
+        kraken_ok = self._seed_from_kraken(asset, timeframe)
+        if kraken_ok:
+            return
 
-            inserted = 0
-            with self._conn.cursor() as cur:
-                for _, row in df.iterrows():
-                    try:
-                        cur.execute(
-                            """INSERT INTO candles (asset, timeframe, timestamp, open, high, low, close, volume)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                               ON CONFLICT (asset, timeframe, timestamp) DO NOTHING""",
-                            (
-                                asset.upper(), timeframe, row[ts_col],
-                                float(row["open"]), float(row["high"]),
-                                float(row["low"]), float(row["close"]),
-                                float(row.get("volume", 0)),
-                            ),
-                        )
-                        inserted += 1
-                    except Exception:
-                        pass  # skip bad rows
-            log.info("  %s %s: seeded %d candles from %s", asset, timeframe, inserted, csv_path)
+        # Kraken bootstrap failed — try CryptoCompare
+        log.info("  %s %s: Kraken bootstrap failed, trying CryptoCompare...", asset, timeframe)
+        self._seed_from_cryptocompare(asset, timeframe)
+
+    def _seed_from_kraken(self, asset: str, timeframe: str) -> bool:
+        """Bootstrap candle history from Kraken spot REST API. Returns True if any data was ingested."""
+        try:
+            from live.exchange.kraken import KrakenSpotClient, SPOT_PAIRS
+        except ImportError:
+            return False
+
+        if asset.upper() not in SPOT_PAIRS:
+            log.debug("  %s: not in SPOT_PAIRS, skipping Kraken bootstrap", asset)
+            return False
+
+        tf_to_minutes = {"1h": 60, "15m": 15, "4h": 240, "1d": 1440}
+        interval_min = tf_to_minutes.get(timeframe)
+        if interval_min is None:
+            return False
+
+        pair = SPOT_PAIRS[asset.upper()]
+        client = KrakenSpotClient()
+        page_size = 720
+        max_pages = 15
+        # Start from ~1 year ago
+        since = int(_time.time()) - 365 * 24 * 3600
+        total_inserted = 0
+        pages_fetched = 0
+
+        try:
+            for page in range(1, max_pages + 1):
+                raw = client.get_ohlc(pair=pair, interval=interval_min, since=since)
+                if not raw:
+                    break
+
+                inserted = 0
+                last_ts = since
+                now_ts = int(_time.time())
+                with self._conn.cursor() as cur:
+                    for candle in raw:
+                        ts_unix = candle["timestamp"]
+                        if ts_unix > now_ts:
+                            break
+                        ts = pd.Timestamp(ts_unix, unit="s", tz="UTC")
+                        try:
+                            cur.execute(
+                                """INSERT INTO candles (asset, timeframe, timestamp, open, high, low, close, volume)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                   ON CONFLICT (asset, timeframe, timestamp) DO NOTHING""",
+                                (asset.upper(), timeframe, ts,
+                                 candle["open"], candle["high"], candle["low"],
+                                 candle["close"], candle["volume"]),
+                            )
+                            inserted += 1
+                            last_ts = ts_unix
+                        except Exception:
+                            pass
+
+                total_inserted += inserted
+                pages_fetched += 1
+                log.info("  %s %s Kraken page %d: +%d candles", asset, timeframe, page, inserted)
+
+                if len(raw) < page_size:
+                    break  # reached current time
+                since = last_ts
+                _time.sleep(0.3)  # rate limit
+
         except Exception:
-            log.warning("Failed to seed %s %s from CSV", asset, timeframe, exc_info=True)
+            log.warning("Kraken bootstrap failed for %s %s", asset, timeframe, exc_info=True)
+
+        if total_inserted > 0:
+            log.info("Seeded %s %s from Kraken API (%d pages, %d candles)", asset, timeframe, pages_fetched, total_inserted)
+            return True
+        return False
+
+    def _seed_from_cryptocompare(self, asset: str, timeframe: str) -> None:
+        """Bootstrap candle history from CryptoCompare free API (histohour)."""
+        if timeframe not in ("1h", "15m"):
+            log.debug("  %s %s: CryptoCompare only supports 1h/15m", asset, timeframe)
+            return
+
+        endpoint = "histohour" if timeframe == "1h" else "histominute"
+        # CryptoCompare histominute is unreliable for 15m; only use histohour
+        if timeframe == "15m":
+            log.debug("  %s 15m: CryptoCompare histominute not reliable for 15m, skipping", asset)
+            return
+
+        limit = 2000
+        max_pages = 15
+        to_ts = int(_time.time())
+        one_year_ago = to_ts - 365 * 24 * 3600
+        total_inserted = 0
+        pages_fetched = 0
+
+        try:
+            for page in range(1, max_pages + 1):
+                url = (
+                    f"https://min-api.cryptocompare.com/data/v2/{endpoint}"
+                    f"?fsym={asset.upper()}&tsym=USD&limit={limit}&toTs={to_ts}"
+                )
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+
+                if data.get("Response") != "Success":
+                    log.warning("  %s CryptoCompare error: %s", asset, data.get("Message"))
+                    break
+
+                candles = data.get("Data", {}).get("Data", [])
+                if not candles:
+                    break
+
+                inserted = 0
+                earliest_ts = to_ts
+                with self._conn.cursor() as cur:
+                    for c in candles:
+                        ts_unix = c.get("time", 0)
+                        if ts_unix <= 0:
+                            continue
+                        ts = pd.Timestamp(ts_unix, unit="s", tz="UTC")
+                        try:
+                            cur.execute(
+                                """INSERT INTO candles (asset, timeframe, timestamp, open, high, low, close, volume)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                   ON CONFLICT (asset, timeframe, timestamp) DO NOTHING""",
+                                (asset.upper(), timeframe, ts,
+                                 float(c.get("open", 0)), float(c.get("high", 0)),
+                                 float(c.get("low", 0)), float(c.get("close", 0)),
+                                 float(c.get("volumeto", 0))),
+                            )
+                            inserted += 1
+                            if ts_unix < earliest_ts:
+                                earliest_ts = ts_unix
+                        except Exception:
+                            pass
+
+                total_inserted += inserted
+                pages_fetched += 1
+                log.info("  %s %s CryptoCompare page %d: +%d candles", asset, timeframe, page, inserted)
+
+                if earliest_ts <= one_year_ago:
+                    break  # got 1 year of history
+                to_ts = earliest_ts - 1
+                _time.sleep(0.3)
+
+        except Exception:
+            log.warning("CryptoCompare bootstrap failed for %s %s", asset, timeframe, exc_info=True)
+
+        if total_inserted > 0:
+            log.info("Seeded %s %s from CryptoCompare (%d pages, %d candles)", asset, timeframe, pages_fetched, total_inserted)
 
     def get_candles(
         self,
@@ -328,6 +518,24 @@ class PostgresDataProvider(DataProvider):
                 )
         except Exception:
             log.warning("Failed to ingest candle for %s", asset, exc_info=True)
+
+
+    def get_max_timestamp(self, asset: str, timeframe: str = "1h") -> Optional[object]:
+        """Return the latest candle timestamp for asset+timeframe, or None if no data."""
+        if not self._ensure_conn():
+            return None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT MAX(timestamp) FROM candles WHERE asset=%s AND timeframe=%s",
+                    (asset.upper(), timeframe),
+                )
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    return row[0]
+        except Exception:
+            log.warning("Failed to get max timestamp for %s %s", asset, timeframe)
+        return None
 
 
 class CsvDataProvider(DataProvider):

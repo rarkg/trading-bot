@@ -532,10 +532,33 @@ class LiveRunner:
 
     def _reconcile_db_with_exchange(self) -> None:
         """Every cycle: close any DB-OPEN trades that no longer exist on Kraken.
-        This prevents the dashboard showing trades that were already closed on exchange."""
+        Also sweeps dust positions (notional < $5) left behind by partial closes."""
         if self.bot_id is None:
             return
         try:
+            # Dust sweep: close any exchange positions too small to manage
+            DUST_THRESHOLD_USD = 5.0
+            try:
+                all_positions = self.executor.get_positions()
+                for p in all_positions:
+                    sym = p.get("symbol", "")
+                    size = float(p.get("size", 0))
+                    ep = float(p.get("entry_price", 0))
+                    notional = size * ep
+                    if 0 < notional < DUST_THRESHOLD_USD:
+                        asset = sym.split("/")[0].upper()
+                        close_side = "sell" if p.get("side", "long") == "long" else "buy"
+                        log.warning("DUST: %s notional=$%.2f < $%.0f — closing", asset, notional, DUST_THRESHOLD_USD)
+                        try:
+                            from live.exchange.kraken import CCXT_SYMBOLS
+                            ccxt_sym = CCXT_SYMBOLS.get(asset, asset + "/USD:USD")
+                            self.executor.place_market_order(asset, close_side, size, reduce_only=True)
+                            log.info("DUST: Closed %s dust position (%.6f contracts)", asset, size)
+                        except Exception:
+                            log.warning("DUST: Failed to close dust position for %s", asset, exc_info=True)
+            except Exception:
+                log.warning("DUST: Sweep failed", exc_info=True)
+
             exchange_positions = self.executor.get_positions()
             # symbol format is "ADA/USD:USD" — extract base asset (e.g. "ADA")
             exchange_assets = {p["symbol"].split("/")[0].upper() for p in exchange_positions if p.get("symbol")}

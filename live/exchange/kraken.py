@@ -22,6 +22,7 @@ SPOT_PAIRS: dict[str, str] = {
     "XRP": "XRPUSD",
     "ICP": "ICPUSD",
     "SHIB": "SHIBUSD",
+    "WLFI": "WLFIUSD",
 }
 
 FUTURES_SYMBOLS: dict[str, str] = {
@@ -35,6 +36,7 @@ FUTURES_SYMBOLS: dict[str, str] = {
     "XRP": "PF_XRPUSD",
     "ICP": "PF_ICPUSD",
     "SHIB": "PF_SHIBUSD",
+    "WLFI": "PF_WLFIUSD",
 }
 
 # ccxt market IDs for Kraken Futures
@@ -49,6 +51,7 @@ CCXT_SYMBOLS: dict[str, str] = {
     "XRP": "XRP/USD:USD",
     "ICP": "ICP/USD:USD",
     "SHIB": "SHIB/USD:USD",
+    "WLFI": "WLFI/USD:USD",
 }
 
 SPOT_BASE_URL = "https://api.kraken.com"

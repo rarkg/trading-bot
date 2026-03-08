@@ -4,7 +4,7 @@
 INITIAL_CAPITAL = 5_000.0  # USD total
 
 # Assets
-ASSETS = ["BTC", "ETH", "SOL", "LINK", "ADA", "AVAX", "DOGE", "XRP", "ICP", "SHIB"]
+ASSETS = ["BTC", "ETH", "SOL", "LINK", "ADA", "AVAX", "DOGE", "XRP", "ICP", "SHIB", "WLFI"]
 CAPITAL_PER_ASSET = INITIAL_CAPITAL / len(ASSETS)  # $500 per asset
 
 # Kraken symbol mapping
@@ -19,6 +19,7 @@ SYMBOL_MAP = {
     "XRP": "PF_XRPUSD",
     "ICP": "PF_ICPUSD",
     "SHIB": "PF_SHIBUSD",
+    "WLFI": "PF_WLFIUSD",
 }
 
 # Risk

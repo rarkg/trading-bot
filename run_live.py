@@ -643,17 +643,38 @@ class LiveRunner:
                         ccxt_sym = CCXT_SYMBOLS.get(asset.upper(), asset + "/USD:USD")
                         pf_sym = f"pf_{asset.lower()}usd"
 
-                        # Primary: account log has realized_pnl + trade_price per fill
-                        result = self.executor.client.exchange.history_get_account_log({"count": 20})
+                        # Primary: sum ALL account_log entries for this contract to get true net PnL
+                        # Kraken logs fees, funding, and trade PnL as separate entries — must sum all
+                        FEE_TYPES = {"futures trade", "liquidation", "funding rate payment",
+                                     "taker fee", "maker fee", "settlement", "futures liquidation fee"}
+                        result = self.executor.client.exchange.history_get_account_log({"count": 50})
+                        total_pnl = 0.0
+                        found_trade = False
                         for entry_log in result.get("logs", []):
-                            if (entry_log.get("asset") == "usd"
-                                    and entry_log.get("contract") == pf_sym
-                                    and entry_log.get("info") == "futures trade"):
-                                exit_price = float(entry_log.get("trade_price") or 0) or None
-                                pnl_usd = float(entry_log.get("realized_pnl") or 0) or None
-                                log.info("RECONCILE: %s account_log exit_price=%.6f pnl_usd=%.4f",
-                                         asset, exit_price or 0, pnl_usd or 0)
-                                break
+                            if entry_log.get("asset") != "usd":
+                                continue
+                            if entry_log.get("contract") != pf_sym:
+                                continue
+                            info = entry_log.get("info", "")
+                            change = float(entry_log.get("change") or 0)
+                            if info == "futures trade":
+                                # Grab exit price from the trade entry
+                                tp = float(entry_log.get("trade_price") or 0)
+                                if tp:
+                                    exit_price = tp
+                                total_pnl += change
+                                found_trade = True
+                                log.info("RECONCILE: %s account_log trade entry: change=%.4f trade_price=%.6f",
+                                         asset, change, tp)
+                            elif any(fee in info for fee in FEE_TYPES):
+                                total_pnl += change
+                                log.info("RECONCILE: %s account_log fee entry (%s): change=%.4f",
+                                         asset, info, change)
+
+                        if found_trade:
+                            pnl_usd = round(total_pnl, 4)
+                            log.info("RECONCILE: %s total net PnL (trade+fees+funding)=%.4f exit_price=%.6f",
+                                     asset, pnl_usd, exit_price or 0)
 
                         # Fallback: fetch_my_trades for exit price
                         if exit_price is None:
@@ -663,15 +684,16 @@ class LiveRunner:
                     except Exception:
                         log.warning("RECONCILE: Could not fetch exit data for %s", asset, exc_info=True)
 
-                    # Final fallback: compute PnL from entry vs exit price
+                    # Final fallback: compute PnL from entry vs exit price (includes leverage)
                     if pnl_usd is None and exit_price and row.get("entry_price") and row.get("size_usd"):
                         entry_p = float(row["entry_price"])
                         size = float(row["size_usd"])
+                        leverage = float(row.get("leverage") or 1)
                         direction = row.get("direction", "LONG")
                         raw = (exit_price - entry_p) / entry_p if direction == "LONG" else (entry_p - exit_price) / entry_p
-                        pnl_usd = round(size * raw, 2)
-                        log.info("RECONCILE: %s computed pnl=%.2f from entry=%.4f exit=%.4f",
-                                 asset, pnl_usd, entry_p, exit_price)
+                        pnl_usd = round(size * raw * leverage, 2)
+                        log.info("RECONCILE: %s computed pnl=%.2f (size=%.2f lev=%.1fx) from entry=%.4f exit=%.4f",
+                                 asset, pnl_usd, size, leverage, entry_p, exit_price)
 
                     log.info("RECONCILE: Closing %s id=%d exit_price=%s pnl_usd=%s", asset, trade_id, exit_price, pnl_usd)
                     self.pg.close_trade_by_id(trade_id, "EXCHANGE_CLOSED", exit_price=exit_price, pnl_usd=pnl_usd)

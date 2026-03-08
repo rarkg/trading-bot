@@ -683,6 +683,24 @@ class LiveRunner:
         except Exception:
             log.exception("Failed to close %s %s position on exchange", pos.asset, pos.strategy)
 
+        # Post-close dust sweep: if a tiny remnant is left, close it immediately
+        try:
+            import time as _time
+            _time.sleep(1)  # brief wait for exchange to settle
+            all_pos = self.executor.get_positions()
+            for p in all_pos:
+                if p.get("symbol", "").split("/")[0].upper() == pos.asset.upper():
+                    rem_size = float(p.get("size", 0))
+                    rem_ep = float(p.get("entry_price", 0))
+                    rem_notional = rem_size * rem_ep
+                    if 0 < rem_notional < 10.0:
+                        dust_side = "sell" if p.get("side", "long") == "long" else "buy"
+                        log.warning("DUST: %s remnant $%.4f after close — sweeping", pos.asset, rem_notional)
+                        self.executor.place_market_order(pos.asset, dust_side, rem_size, reduce_only=True)
+                        log.info("DUST: Swept %s remnant %.6f contracts", pos.asset, rem_size)
+        except Exception:
+            log.warning("DUST: Post-close sweep failed for %s", pos.asset, exc_info=True)
+
         # Postgres
         if pos.trade_id is not None:
             self.pg.log_trade_close(pos.trade_id, price, exit_reason, pnl_usd, pnl_pct * 100)

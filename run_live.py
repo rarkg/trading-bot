@@ -217,15 +217,77 @@ class LiveRunner:
 
         log.info("Initial data loaded. Entering main loop.")
 
-        # Start background thread: write live position status every 10s
+        # Start background thread: write live position status + broadcast via WebSocket every 2s
         import threading
+        import asyncio
+        import websockets
+        import json as _ws_json
+
+        # Shared state for WebSocket broadcast
+        self._ws_clients = set()
+        self._ws_loop = None
+        self._ws_last_payload = None
+
+        async def _ws_handler(websocket):
+            self._ws_clients.add(websocket)
+            log.info(f"[WS] Client connected ({len(self._ws_clients)} total)")
+            try:
+                # Send current state immediately on connect
+                if self._ws_last_payload:
+                    await websocket.send(self._ws_last_payload)
+                await websocket.wait_closed()
+            finally:
+                self._ws_clients.discard(websocket)
+                log.info(f"[WS] Client disconnected ({len(self._ws_clients)} total)")
+
+        async def _ws_server():
+            import socket as _sock
+            sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            sock.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", 8765))
+            sock.setblocking(False)
+            async with websockets.serve(_ws_handler, sock=sock):
+                log.info("[WS] WebSocket server started on ws://0.0.0.0:8765")
+                await asyncio.Future()  # run forever
+
+        def _ws_thread():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._ws_loop = loop
+            loop.run_until_complete(_ws_server())
+
+        threading.Thread(target=_ws_thread, daemon=True).start()
+
         def _position_status_loop():
             while not self._shutdown:
                 try:
-                    self._write_live_status()
+                    payload = self._build_live_payload()
+                    payload_str = _ws_json.dumps(payload)
+                    self._ws_last_payload = payload_str
+                    # Write JSON file (legacy fallback)
+                    try:
+                        with open("/tmp/bot-live-status.json", "w") as f:
+                            f.write(payload_str)
+                    except Exception:
+                        pass
+                    # Broadcast to all WebSocket clients
+                    if self._ws_clients and self._ws_loop:
+                        clients = list(self._ws_clients)
+                        asyncio.run_coroutine_threadsafe(
+                            _broadcast(clients, payload_str), self._ws_loop
+                        )
                 except Exception:
                     pass
-                time.sleep(10)
+                time.sleep(2)
+
+        async def _broadcast(clients, msg):
+            import websockets.exceptions
+            for ws in clients:
+                try:
+                    await ws.send(msg)
+                except Exception:
+                    pass
+
         threading.Thread(target=_position_status_loop, daemon=True).start()
 
         while not self._shutdown:
@@ -457,9 +519,8 @@ class LiveRunner:
                 self._tick_opened, self._tick_closed, total_equity,
             )
 
-    def _write_live_status(self) -> None:
-        """Write current open positions + live PnL to /tmp/bot-live-status.json every 10s."""
-        import json as _json
+    def _build_live_payload(self) -> dict:
+        """Build live position payload (used by WebSocket broadcast + JSON file fallback)."""
         positions_out = []
         for key, pos in list(self.positions.items()):
             try:
@@ -489,11 +550,16 @@ class LiveRunner:
                 })
             except Exception:
                 pass
-        payload = {
+        return {
             "ts": datetime.now(timezone.utc).isoformat(),
             "positions": positions_out,
         }
+
+    def _write_live_status(self) -> None:
+        """Legacy: write live status to JSON file."""
+        import json as _json
         try:
+            payload = self._build_live_payload()
             with open("/tmp/bot-live-status.json", "w") as f:
                 _json.dump(payload, f)
         except Exception:

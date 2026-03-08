@@ -545,9 +545,24 @@ class LiveRunner:
                 asset = row["asset"].upper()
                 trade_id = row["id"]
                 if asset not in exchange_assets:
-                    # In DB as OPEN but Kraken doesn't have it — close in DB
-                    log.warning("RECONCILE: %s is OPEN in DB (id=%d) but not on Kraken — closing", asset, trade_id)
-                    self.pg.close_trade_by_id(trade_id, "EXCHANGE_CLOSED")
+                    # In DB as OPEN but Kraken doesn't have it — fetch actual exit from Kraken
+                    log.warning("RECONCILE: %s is OPEN in DB (id=%d) but not on Kraken — fetching exit PnL", asset, trade_id)
+                    exit_price = None
+                    pnl_usd = None
+                    try:
+                        from live.exchange.kraken import CCXT_SYMBOLS
+                        ccxt_sym = CCXT_SYMBOLS.get(asset.upper(), asset + "/USD:USD")
+                        trades = self.executor.client.exchange.fetch_my_trades(ccxt_sym, limit=10)
+                        if trades:
+                            last = trades[-1]
+                            exit_price = float(last.get("price") or 0) or None
+                            # PnL from realized info if available
+                            info = last.get("info", {})
+                            pnl_usd = float(info.get("realizedPnl") or info.get("pnl") or 0) or None
+                            log.info("RECONCILE: %s exit_price=%.4f pnl_usd=%s", asset, exit_price or 0, pnl_usd)
+                    except Exception:
+                        log.warning("RECONCILE: Could not fetch exit trade for %s", asset, exc_info=True)
+                    self.pg.close_trade_by_id(trade_id, "EXCHANGE_CLOSED", exit_price=exit_price, pnl_usd=pnl_usd)
                     # Also remove from in-memory positions
                     keys_to_remove = [k for k, p in self.positions.items() if p.asset == asset]
                     for k in keys_to_remove:

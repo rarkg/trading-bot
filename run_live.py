@@ -666,6 +666,8 @@ class LiveRunner:
                         result = self.executor.client.exchange.history_get_account_log({"count": 50})
                         total_pnl = 0.0
                         found_trade = False
+                        closed_at = None
+                        exit_reason_detected = "EXCHANGE_CLOSED"
                         for entry_log in result.get("logs", []):
                             if entry_log.get("asset") != "usd":
                                 continue
@@ -673,24 +675,37 @@ class LiveRunner:
                                 continue
                             info = entry_log.get("info", "")
                             change = float(entry_log.get("change") or 0)
+                            # Parse close timestamp
+                            raw_date = entry_log.get("date") or entry_log.get("time") or entry_log.get("timestamp")
+                            if raw_date and closed_at is None:
+                                try:
+                                    closed_at = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+                                except Exception:
+                                    pass
                             if info == "futures trade":
-                                # Grab exit price from the trade entry
                                 tp = float(entry_log.get("trade_price") or 0)
                                 if tp:
                                     exit_price = tp
                                 total_pnl += change
                                 found_trade = True
-                                log.info("RECONCILE: %s account_log trade entry: change=%.4f trade_price=%.6f",
-                                         asset, change, tp)
+                                exit_reason_detected = "EXCHANGE_CLOSED"
+                                log.info("RECONCILE: %s account_log trade: change=%.4f price=%.6f date=%s",
+                                         asset, change, tp, raw_date)
+                            elif "liquidation" in info.lower():
+                                total_pnl += change
+                                exit_reason_detected = "LIQUIDATED"
+                                log.warning("RECONCILE: %s LIQUIDATED — fee change=%.4f", asset, change)
+                            elif "settlement" in info.lower():
+                                total_pnl += change
+                                exit_reason_detected = "SETTLEMENT"
                             elif any(fee in info for fee in FEE_TYPES):
                                 total_pnl += change
-                                log.info("RECONCILE: %s account_log fee entry (%s): change=%.4f",
-                                         asset, info, change)
+                                log.info("RECONCILE: %s fee (%s): change=%.4f", asset, info, change)
 
                         if found_trade:
                             pnl_usd = round(total_pnl, 4)
-                            log.info("RECONCILE: %s total net PnL (trade+fees+funding)=%.4f exit_price=%.6f",
-                                     asset, pnl_usd, exit_price or 0)
+                            log.info("RECONCILE: %s net PnL=%.4f reason=%s closed_at=%s",
+                                     asset, pnl_usd, exit_reason_detected, closed_at)
 
                         # Fallback: fetch_my_trades for exit price
                         if exit_price is None:
@@ -711,8 +726,10 @@ class LiveRunner:
                         log.info("RECONCILE: %s computed pnl=%.2f (size=%.2f lev=%.1fx) from entry=%.4f exit=%.4f",
                                  asset, pnl_usd, size, leverage, entry_p, exit_price)
 
-                    log.info("RECONCILE: Closing %s id=%d exit_price=%s pnl_usd=%s", asset, trade_id, exit_price, pnl_usd)
-                    self.pg.close_trade_by_id(trade_id, "EXCHANGE_CLOSED", exit_price=exit_price, pnl_usd=pnl_usd)
+                    log.info("RECONCILE: Closing %s id=%d reason=%s exit_price=%s pnl_usd=%s closed_at=%s",
+                             asset, trade_id, exit_reason_detected, exit_price, pnl_usd, closed_at)
+                    self.pg.close_trade_by_id(trade_id, exit_reason_detected, exit_price=exit_price,
+                                              pnl_usd=pnl_usd, closed_at=closed_at)
                     # Also remove from in-memory positions
                     keys_to_remove = [k for k, p in self.positions.items() if p.asset == asset]
                     for k in keys_to_remove:

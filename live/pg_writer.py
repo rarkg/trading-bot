@@ -309,10 +309,12 @@ class PgWriter:
             log.warning("Failed to update trade entry %s", trade_id, exc_info=True)
 
     def close_trade_by_id(self, trade_id: int, exit_reason: str = "SYNC_CLOSED",
-                          exit_price: float = None, pnl_usd: float = None) -> None:
-        """Mark a trade as closed, optionally recording exit price and PnL."""
+                          exit_price: float = None, pnl_usd: float = None,
+                          closed_at=None) -> None:
+        """Mark a trade as closed, optionally recording exit price, PnL, and exact close time."""
         if not self._ensure_conn():
             return
+        effective_closed_at = closed_at if closed_at is not None else datetime.now(timezone.utc)
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -321,7 +323,7 @@ class PgWriter:
                            exit_price=COALESCE(%s, exit_price),
                            pnl_usd=COALESCE(%s, pnl_usd)
                        WHERE id=%s AND status='OPEN'""",
-                    (exit_reason, datetime.now(timezone.utc), exit_price, pnl_usd, trade_id),
+                    (exit_reason, effective_closed_at, exit_price, pnl_usd, trade_id),
                 )
         except Exception:
             log.warning("Failed to close trade %s in Postgres", trade_id, exc_info=True)

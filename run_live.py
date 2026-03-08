@@ -575,38 +575,37 @@ class LiveRunner:
                     try:
                         from live.exchange.kraken import CCXT_SYMBOLS
                         ccxt_sym = CCXT_SYMBOLS.get(asset.upper(), asset + "/USD:USD")
-                        trades = self.executor.client.exchange.fetch_my_trades(ccxt_sym, limit=10)
-                        if trades:
-                            last = trades[-1]
-                            exit_price = float(last.get("price") or 0) or None
-                            info = last.get("info", {})
-                            pnl_usd = float(info.get("realizedPnl") or info.get("pnl") or 0) or None
-                    except Exception:
-                        log.warning("RECONCILE: Could not fetch exit trade for %s", asset, exc_info=True)
+                        pf_sym = f"pf_{asset.lower()}usd"
 
-                    # Fallback: compute PnL from entry price if Kraken didn't return it
+                        # Primary: account log has realized_pnl + trade_price per fill
+                        result = self.executor.client.exchange.history_get_account_log({"count": 20})
+                        for entry_log in result.get("logs", []):
+                            if (entry_log.get("asset") == "usd"
+                                    and entry_log.get("contract") == pf_sym
+                                    and entry_log.get("info") == "futures trade"):
+                                exit_price = float(entry_log.get("trade_price") or 0) or None
+                                pnl_usd = float(entry_log.get("realized_pnl") or 0) or None
+                                log.info("RECONCILE: %s account_log exit_price=%.6f pnl_usd=%.4f",
+                                         asset, exit_price or 0, pnl_usd or 0)
+                                break
+
+                        # Fallback: fetch_my_trades for exit price
+                        if exit_price is None:
+                            trades = self.executor.client.exchange.fetch_my_trades(ccxt_sym, limit=5)
+                            if trades:
+                                exit_price = float(trades[-1].get("price") or 0) or None
+                    except Exception:
+                        log.warning("RECONCILE: Could not fetch exit data for %s", asset, exc_info=True)
+
+                    # Final fallback: compute PnL from entry vs exit price
                     if pnl_usd is None and exit_price and row.get("entry_price") and row.get("size_usd"):
-                        entry = float(row["entry_price"])
+                        entry_p = float(row["entry_price"])
                         size = float(row["size_usd"])
                         direction = row.get("direction", "LONG")
-                        raw = (exit_price - entry) / entry if direction == "LONG" else (entry - exit_price) / entry
+                        raw = (exit_price - entry_p) / entry_p if direction == "LONG" else (entry_p - exit_price) / entry_p
                         pnl_usd = round(size * raw, 2)
-                        log.info("RECONCILE: %s computed pnl=%.2f from entry=%.4f exit=%.4f dir=%s",
-                                 asset, pnl_usd, entry, exit_price, direction)
-                    elif pnl_usd is None and row.get("entry_price") and row.get("size_usd"):
-                        # No exit price at all — use last known ticker as approximation
-                        try:
-                            ticker = self.executor.fetch_ticker(asset)
-                            exit_price = float(ticker.get("last") or ticker.get("close") or 0) or None
-                            if exit_price:
-                                entry = float(row["entry_price"])
-                                size = float(row["size_usd"])
-                                direction = row.get("direction", "LONG")
-                                raw = (exit_price - entry) / entry if direction == "LONG" else (entry - exit_price) / entry
-                                pnl_usd = round(size * raw, 2)
-                                log.info("RECONCILE: %s ticker-estimated pnl=%.2f exit≈%.4f", asset, pnl_usd, exit_price)
-                        except Exception:
-                            pass
+                        log.info("RECONCILE: %s computed pnl=%.2f from entry=%.4f exit=%.4f",
+                                 asset, pnl_usd, entry_p, exit_price)
 
                     log.info("RECONCILE: Closing %s id=%d exit_price=%s pnl_usd=%s", asset, trade_id, exit_price, pnl_usd)
                     self.pg.close_trade_by_id(trade_id, "EXCHANGE_CLOSED", exit_price=exit_price, pnl_usd=pnl_usd)

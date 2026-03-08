@@ -772,7 +772,21 @@ class LiveRunner:
                 slot_size = min(slot_size, CAPITAL_PER_ASSET * 10)      # cap: max 10x initial per slot
             else:
                 slot_size = CAPITAL_PER_ASSET                            # fallback to fixed
-            log.info("Compound sizing: total_equity=%.2f slot_size=%.2f", total_equity or 0, slot_size)
+
+            # Tiered sizing by signal score (V2.6 backtest: MaxDD 57% → 39%, +3.5% PnL)
+            # Score: 1–2 → 1x, 3–3.5 → 1.5x, 4–4.5 → 2x, 5+ → 3x
+            score = float(sig.get("score", 1.0))
+            if score >= 5.0:
+                score_mult = 3.0
+            elif score >= 4.0:
+                score_mult = 2.0
+            elif score >= 3.0:
+                score_mult = 1.5
+            else:
+                score_mult = 1.0
+            slot_size = min(slot_size * score_mult, CAPITAL_PER_ASSET * 10)
+            log.info("Compound sizing: total_equity=%.2f slot_size=%.2f score=%.1f tier=%.1fx",
+                     total_equity or 0, slot_size, score, score_mult)
         except Exception:
             slot_size = CAPITAL_PER_ASSET
             log.warning("Compound sizing failed — using fixed CAPITAL_PER_ASSET")

@@ -1,169 +1,192 @@
-# Trading Bot Architecture
+# Trading Bot Architecture — Service Separation
 
-## System Overview
+## Overview
 
-```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "background": "#0B1020",
-    "mainBkg": "#121A2B",
-    "primaryColor": "#3B82F6",
-    "primaryTextColor": "#E5E7EB",
-    "primaryBorderColor": "#93C5FD",
-    "lineColor": "#CBD5E1",
-    "secondaryColor": "#10B981",
-    "tertiaryColor": "#F59E0B",
-    "fontFamily": "Inter, SF Pro Text, Segoe UI, sans-serif"
-  }
-}}%%
-graph TB
-    classDef source fill:#0F766E,stroke:#5EEAD4,color:#F0FDFA,stroke-width:1.5px
-    classDef scanner fill:#1D4ED8,stroke:#93C5FD,color:#EFF6FF,stroke-width:1.5px
-    classDef db fill:#B45309,stroke:#FCD34D,color:#FFFBEB,stroke-width:1.5px
-    classDef output fill:#6D28D9,stroke:#C4B5FD,color:#F5F3FF,stroke-width:1.5px
+Split the monolithic `run_live.py` into 4 independent services communicating through
+Postgres (state) and Postgres LISTEN/NOTIFY (real-time events). Each service has one
+job and one external connection.
 
-    subgraph Data Sources
-        YF[Yahoo Finance API]
-        Reddit[Reddit / Manual Trades]
-        Group[Group Chat Convos]
-    end
+## Services
 
-    subgraph Scanners
-        ES[Elio Scanner<br/>Python + pm2]
-        AS[Ana Scanner<br/>Node.js + pm2]
-    end
+### 1. Market Data Service (`services/data_collector.py`)
+**Job:** Collect and store all market data. Single source of truth for candle data.
 
-    subgraph Shared DB - Supabase
-        HC[(hourly_candles)]
-        BS[(breakout_signals)]
-        VH[(vix_hourly)]
-        MP[(market_predictions)]
-        TL[(trades_log)]
-    end
+**Connections:**
+- Kraken public WebSocket (wss://futures.kraken.com/ws/v1) — OHLC stream
+- Postgres — write candles
 
-    subgraph Outputs
-        iMsg[iMessage Group Alert]
-        Dash[Supabase Dashboard]
-    end
+**Behavior:**
+- On startup: gap-fill from REST (last DB timestamp → now, with pagination)
+- Runtime: subscribe to OHLC channels for all assets × all timeframes (1h, 15m)
+- On each completed candle: INSERT into `candles` table, emit `NOTIFY new_candle, '{asset}:{timeframe}'`
+- On partial candle update: update in-memory state (for live price), do NOT write partial to DB
+- Reconnection: auto-reconnect with exponential backoff, gap-fill on reconnect
+- Health: log heartbeat every 60s, pm2 managed
 
-    YF --> ES
-    YF --> AS
-    Reddit --> TL
-    Group --> MP
+**Does NOT:**
+- Run strategies
+- Place orders
+- Know about positions
 
-    ES --> HC
-    ES --> BS
-    ES --> VH
-    AS --> HC
-    AS --> BS
-    AS --> VH
+---
 
-    BS -->|BREAKOUT_UP / BREAKDOWN| iMsg
-    HC --> Dash
-    BS --> Dash
-    MP --> Dash
+### 2. Trading Engine (`services/trade_engine.py`)
+**Job:** Run strategies on new candles, generate signals. Pure logic, no I/O to exchange.
 
-    class YF,Reddit,Group source
-    class ES,AS scanner
-    class HC,BS,VH,MP,TL db
-    class iMsg,Dash output
+**Connections:**
+- Postgres — read candles, write signals, LISTEN for new_candle events
+
+**Behavior:**
+- LISTEN on `new_candle` channel
+- On notification: load candle history from Postgres for the asset
+- Run all active strategies (candle_v2_6, squeeze_v15, future S/R filter)
+- If signal generated: INSERT into `signals` table, emit `NOTIFY new_signal`
+- Stateless — can restart at any time without data loss
+
+**Signals table schema:**
+```sql
+CREATE TABLE signals (
+    id SERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    asset VARCHAR(10) NOT NULL,
+    strategy VARCHAR(50) NOT NULL,
+    direction VARCHAR(5) NOT NULL,  -- LONG / SHORT
+    signal_name VARCHAR(100),       -- e.g. CDLENGULFING|s2.0
+    entry_price DOUBLE PRECISION,
+    stop_price DOUBLE PRECISION,
+    target_price DOUBLE PRECISION,
+    score DOUBLE PRECISION,
+    metadata JSONB,                 -- strategy-specific data
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'  -- pending / accepted / rejected / expired
+);
 ```
 
-## Data Flow (Hourly Cycle)
+**Does NOT:**
+- Fetch market data from exchange
+- Place orders
+- Track positions
 
-```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "background": "#FFFFFF",
-    "mainBkg": "#F8FAFC",
-    "primaryTextColor": "#0F172A",
-    "lineColor": "#334155",
-    "fontFamily": "Inter, SF Pro Text, Segoe UI, sans-serif"
-  }
-}}%%
-sequenceDiagram
-    participant PM as pm2
-    participant SC as Scanner
-    participant YF as Yahoo Finance
-    participant DB as Supabase
-    participant GC as Group Chat
+---
 
-    PM->>SC: Poll every 5 min
-    SC->>SC: Is market open? (9:30-4:30 ET)
-    alt Market Closed
-        SC->>SC: Sleep
-    else Market Open
-        SC->>SC: New hour boundary?
-        SC->>YF: Fetch SPX + VIX hourly
-        YF-->>SC: Candle data
-        SC->>SC: Detect breakout/rejection
-        SC->>DB: Upsert candles + signals
-        alt Strong Signal
-            SC->>GC: Alert via iMessage
-        end
-    end
+### 3. Execution Service (`services/executor.py`)
+**Job:** Execute signals, manage orders and positions. Source of truth for position state.
+
+**Connections:**
+- Kraken Futures API (REST) — place/cancel orders
+- Kraken private WebSocket — real-time fill notifications
+- Postgres — read signals, write positions/trades, LISTEN for new_signal events
+
+**Behavior:**
+- LISTEN on `new_signal` channel
+- On notification: read signal from DB, validate (risk check, asset tradeable, no duplicate position)
+- If valid: place order via REST, update signal status to 'accepted', create position record
+- Place SL/TP orders on exchange
+- Private WebSocket: subscribe to `executions` channel
+- On fill event: update position state immediately, log trade, emit `NOTIFY position_update`
+- Reconciliation: every 5 min, compare DB positions vs exchange positions (safety net)
+- Dust sweep: clean up positions < $10 notional
+
+**Positions table schema:**
+```sql
+CREATE TABLE positions (
+    id SERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    asset VARCHAR(10) NOT NULL,
+    strategy VARCHAR(50) NOT NULL,
+    direction VARCHAR(5) NOT NULL,
+    entry_price DOUBLE PRECISION NOT NULL,
+    size_usd DOUBLE PRECISION NOT NULL,
+    stop_price DOUBLE PRECISION,
+    target_price DOUBLE PRECISION,
+    sl_order_id VARCHAR(100),
+    tp_order_id VARCHAR(100),
+    signal_id INTEGER REFERENCES signals(id),
+    status VARCHAR(20) NOT NULL DEFAULT 'open',  -- open / closed
+    exit_price DOUBLE PRECISION,
+    exit_reason VARCHAR(50),        -- STOP / TARGET / TIME_EXIT / MANUAL
+    exit_at TIMESTAMPTZ,
+    pnl_usd DOUBLE PRECISION,
+    pnl_pct DOUBLE PRECISION,
+    metadata JSONB
+);
 ```
 
-## Breakout Detection Logic
+**Does NOT:**
+- Fetch candle data
+- Run strategies
+- Serve dashboard
 
-```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "background": "#FFFFFF",
-    "mainBkg": "#F8FAFC",
-    "lineColor": "#334155",
-    "fontFamily": "Inter, SF Pro Text, Segoe UI, sans-serif"
-  }
-}}%%
-flowchart TD
-    classDef bullish fill:#16A34A,stroke:#166534,color:#F0FDF4,stroke-width:1.5px
-    classDef bearish fill:#DC2626,stroke:#7F1D1D,color:#FEF2F2,stroke-width:1.5px
-    classDef neutral fill:#64748B,stroke:#334155,color:#F8FAFC,stroke-width:1.5px
-    classDef decision fill:#2563EB,stroke:#1E3A8A,color:#EFF6FF,stroke-width:1.5px
+---
 
-    A[Current Hour Candle] --> B{Broke Previous High?}
-    B -->|Yes| C{Close > Prev High?}
-    C -->|Yes| D[BREAKOUT_UP]:::bullish
-    C -->|No| E[REJECTION_HIGH]:::bearish
-    B -->|No| F{Broke Previous Low?}
-    F -->|Yes| G{Close < Prev Low?}
-    G -->|Yes| H[BREAKDOWN]:::bearish
-    G -->|No| I[REJECTION_LOW_BOUNCE]:::bullish
-    F -->|No| J[INSIDE / Consolidation]:::neutral
+### 4. Dashboard API (`beacon` — already exists)
+**Job:** Read-only view of system state for the frontend.
 
-    class B,C,F,G decision
+**Connections:**
+- Postgres — read candles, positions, signals, trades
+- LISTEN on `position_update` for real-time push to WebSocket clients
+
+**Behavior:**
+- Serve WebSocket to frontend with live position data
+- REST endpoints for historical trades, equity curve, signal history
+- Pure read-only — never writes to DB, never touches exchange
+
+---
+
+## Communication Flow
+
+```
+Kraken WS (public)
+       │
+       ▼
+  Data Collector ──write──▶ Postgres `candles`
+       │                        │
+       │ NOTIFY new_candle      │ LISTEN new_candle
+       │                        ▼
+       │                  Trade Engine ──write──▶ Postgres `signals`
+       │                        │
+       │                        │ NOTIFY new_signal
+       │                        ▼
+       │                  Executor ──write──▶ Postgres `positions`
+       │                     │  ▲
+       │                     │  │ fill events
+       │                     ▼  │
+       │              Kraken WS (private) + REST
+       │
+       │ LISTEN position_update
+       ▼
+    Dashboard (beacon) ──▶ Frontend WebSocket
 ```
 
-## Prediction Tracking
+## Postgres Channels (LISTEN/NOTIFY)
+- `new_candle` — payload: `{asset}:{timeframe}` (e.g. `BTC:1h`)
+- `new_signal` — payload: `{signal_id}` (e.g. `42`)
+- `position_update` — payload: `{position_id}:{event}` (e.g. `7:filled`, `7:closed`)
 
-```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "background": "#FFFFFF",
-    "mainBkg": "#F8FAFC",
-    "lineColor": "#334155",
-    "fontFamily": "Inter, SF Pro Text, Segoe UI, sans-serif"
-  }
-}}%%
-flowchart LR
-    A[Pre-Market Thesis] --> B[Log to market_predictions]
-    B --> C[Source + Direction + Confidence]
-    C --> D[Market Close]
-    D --> E[Record Actual Direction]
-    E --> F{Correct?}
-    F -->|Yes| G[Track Win Rate]
-    F -->|No| H[Post-Mortem]
-```
+## Shared Code (`live/` package)
+- `live/config.py` — assets, capital, risk params (all services read)
+- `live/data_provider.py` — Postgres candle read/write (data collector + engine)
+- `live/exchange/kraken.py` — Kraken API clients (data collector + executor)
+- `strategies/` — strategy implementations (engine only)
 
-## Infrastructure
+## pm2 Process Names
+- `data-collector` — Market Data Service
+- `trade-engine` — Trading Engine
+- `executor` — Execution Service
+- `beacon` — Dashboard (already exists)
 
-| Component | Host | Tech | Manager |
-|-----------|------|------|---------|
-| Elio Scanner | Dan's Mac Mini | Python + yfinance + psycopg2 | pm2 |
-| Ana Scanner | Khanh's MacBook | Node.js + pg + https | pm2 |
-| Shared DB | Supabase (us-west-2) | PostgreSQL | Supabase |
-| Alerts | iMessage Group Chat #6 | imsg CLI / BlueBubbles | OpenClaw |
+## Migration from run_live.py
+1. Create `services/` directory
+2. Build data_collector.py first (WebSocket + Postgres) — test standalone
+3. Build trade_engine.py (LISTEN + strategy) — test with data_collector running
+4. Build executor.py (LISTEN + Kraken private WS) — test full pipeline
+5. Update beacon to read from new tables
+6. Retire run_live.py
+
+## Edge Cases
+- WebSocket disconnect: auto-reconnect + gap-fill from REST on reconnect
+- Postgres down: all services retry connection with backoff, log alerts
+- Duplicate signals: executor checks for existing open position on same asset before accepting
+- Signal expiration: signals older than 1 candle period are marked 'expired'
+- Service restart ordering: data_collector first, then engine, then executor (but each handles missing dependencies gracefully)
+- Rate limits: only executor hits authenticated endpoints; data_collector uses public WS (no rate limit)

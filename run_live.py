@@ -23,7 +23,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from strategies.squeeze_v15 import SqueezeV15
-from strategies.candle_v2_3 import CandleV2_3
+from strategies.candle_v2_6 import CandleV2_6
 from backtest.engine import Trade
 from live.feed import LiveFeed
 from live.executor import KrakenExecutor
@@ -95,11 +95,11 @@ def make_squeeze_strategies() -> dict[str, SqueezeV15]:
     return strats
 
 
-def make_candle_strategies() -> dict[str, CandleV2_3]:
-    """Create one CandleV2_3 per asset with MTF enabled."""
+def make_candle_strategies() -> dict[str, CandleV2_6]:
+    """Create one CandleV2_6 per asset with MTF enabled."""
     strats = {}
     for asset in ASSETS:
-        strats[asset] = CandleV2_3(
+        strats[asset] = CandleV2_6(
             # V2.5: tighter trail, score 1, adx 50, R:R 2:4
             min_score=1,
             stop_atr=2.0,
@@ -162,7 +162,7 @@ class LiveRunner:
             "assets": config.ASSETS,
             "capital": config.INITIAL_CAPITAL,
             "demo": config.DEMO,
-            "strategies": ["candle_v2_5"],
+            "strategies": ["candle_v2_6"],
         })  # type: Optional[int]
 
         # Strategies: one per asset per strategy type
@@ -419,13 +419,13 @@ class LiveRunner:
             self._check_exits(asset, df, i, price)
 
             # self._run_strategy(asset, "squeeze_v15", self.squeeze[asset], df, i, price)  # V15 disabled per Dan
-            self._run_strategy(asset, "candle_v2_5", self.candle[asset], df, i, price)
+            self._run_strategy(asset, "candle_v2_6", self.candle[asset], df, i, price)
             self._tick_signals += 1
 
             # Log equity to Postgres — real equity = slot capital + unrealized PnL on open pos
             if self.bot_id is not None:
                 open_count = sum(1 for pos in self.positions.values() if pos.asset == asset)
-                asset_key = (asset, "candle_v2_5")
+                asset_key = (asset, "candle_v2_6")
                 unrealized = 0.0
                 if asset_key in self.positions:
                     pos = self.positions[asset_key]

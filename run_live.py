@@ -278,7 +278,7 @@ class LiveRunner:
                         )
                 except Exception:
                     pass
-                time.sleep(2)
+                time.sleep(1)
 
         async def _broadcast(clients, msg):
             import websockets.exceptions
@@ -520,13 +520,29 @@ class LiveRunner:
             )
 
     def _build_live_payload(self) -> dict:
-        """Build live position payload (used by WebSocket broadcast + JSON file fallback)."""
+        """Build live position payload — batch fetch all tickers in one call for speed."""
         positions_out = []
-        for key, pos in list(self.positions.items()):
+        # Batch fetch all open position tickers in a single API call
+        open_positions = list(self.positions.items())
+        ccxt_syms = [CCXT_SYMBOLS.get(pos.asset.upper(), "") for _, pos in open_positions]
+        ccxt_syms = [s for s in ccxt_syms if s]
+        prices: dict = {}
+        try:
+            if ccxt_syms:
+                tickers = self.executor.client.exchange.fetch_tickers(ccxt_syms)
+                for sym, ticker in tickers.items():
+                    prices[sym] = float(ticker.get("last") or ticker.get("close") or 0)
+        except Exception:
+            pass  # Fall through to per-position fallback below
+
+        for key, pos in open_positions:
             try:
                 ccxt_sym = CCXT_SYMBOLS.get(pos.asset.upper(), "")
-                ticker = self.executor.client.exchange.fetch_ticker(ccxt_sym) if ccxt_sym else {}
-                price = float(ticker.get("last") or ticker.get("close") or 0)
+                price = prices.get(ccxt_sym, 0)
+                if not price:
+                    # Per-position fallback if batch missed it
+                    ticker = self.executor.client.exchange.fetch_ticker(ccxt_sym) if ccxt_sym else {}
+                    price = float(ticker.get("last") or ticker.get("close") or 0)
                 t = pos.trade
                 if price > 0:
                     if t.direction == "LONG":

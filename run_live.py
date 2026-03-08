@@ -26,6 +26,7 @@ from strategies.squeeze_v15 import SqueezeV15
 from strategies.candle_v2_6 import CandleV2_6
 from backtest.engine import Trade
 from live.feed import LiveFeed
+from live.data_provider import PostgresDataProvider, KrakenDataProvider
 from live.executor import KrakenExecutor
 from live.risk import RiskManager
 from live.pg_writer import PgWriter
@@ -152,7 +153,8 @@ class LiveRunner:
         api_key = os.environ["KRAKEN_DEMO_API_KEY"]
         api_secret = os.environ["KRAKEN_DEMO_API_SECRET"]
 
-        self.feed = LiveFeed()
+        self.feed = LiveFeed()  # used for incremental candle fetches on each tick
+        self.data_provider = PostgresDataProvider(fallback=KrakenDataProvider())
         self.executor = KrakenExecutor(api_key, api_secret, demo=config.DEMO)
         self.risk_mgr = RiskManager(max_risk_per_trade=config.MAX_RISK_PER_TRADE)
 
@@ -299,6 +301,7 @@ class LiveRunner:
 
         log.info("=== Shutdown complete ===")
         self.pg.close()
+        self.data_provider.close()
 
     def _handle_signal(self, signum, frame):
         log.info("Received signal %d, shutting down gracefully...", signum)
@@ -418,10 +421,15 @@ class LiveRunner:
             log.info("SYNC: No open positions")
 
     def _load_initial_data(self):
-        """Fetch initial candle history for all assets."""
+        """Seed Postgres from CSVs (if empty), then load full history for all assets."""
+        log.info("Seeding candle DB from CSV history...")
+        for asset in ASSETS:
+            self.data_provider.seed_if_empty(asset, "1h")
+
+        log.info("Loading candle history from Postgres...")
         for asset in ASSETS:
             try:
-                df = self.feed.get_candles(asset, "1h")
+                df = self.data_provider.get_candles(asset, "1h", limit=8760)
                 if len(df) > 0:
                     self.candle_cache[asset] = df
                     log.info("  %s: loaded %d hourly candles", asset, len(df))
@@ -438,12 +446,44 @@ class LiveRunner:
         log.info("--- Scanning: %s ---", now.strftime("%H:%M UTC"))
         self.last_processed_hour = current_hour
 
-        # Fetch latest candles for all assets
+        # Fetch only NEW candles since last cached timestamp (incremental update)
         for asset in ASSETS:
             try:
-                df = self.feed.get_candles(asset, "1h")
-                if len(df) > 0:
-                    self.candle_cache[asset] = df
+                since = None
+                if asset in self.candle_cache and len(self.candle_cache[asset]) > 0:
+                    last_ts = self.candle_cache[asset].index[-1]
+                    # 2h overlap to avoid gaps (Kraken returns candles after `since`)
+                    since = int(last_ts.timestamp()) - 2 * 3600
+
+                new_df = self.feed.get_candles(asset, "1h", since=since)
+                n_new = len(new_df)
+
+                if n_new > 0:
+                    # Persist new candles to Postgres
+                    for ts, row in new_df.iterrows():
+                        self.data_provider.ingest_candle(
+                            asset=asset,
+                            timeframe="1h",
+                            timestamp=ts,
+                            open_=float(row["open"]),
+                            high=float(row["high"]),
+                            low=float(row["low"]),
+                            close=float(row["close"]),
+                            volume=float(row["volume"]),
+                        )
+
+                    if asset in self.candle_cache:
+                        combined = pd.concat([self.candle_cache[asset], new_df])
+                        combined = combined[~combined.index.duplicated(keep="last")]
+                        combined = combined.sort_index()
+                        self.candle_cache[asset] = combined
+                    else:
+                        self.candle_cache[asset] = new_df
+
+                cache_size = len(self.candle_cache.get(asset, []))
+                log.debug("%s: +%d new candles (cache=%d)", asset, n_new, cache_size)
+                if n_new > 0:
+                    log.info("%s: fetched %d new candle(s), cache=%d total", asset, n_new, cache_size)
             except Exception:
                 log.exception("Failed to fetch %s candles", asset)
 

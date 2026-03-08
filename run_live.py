@@ -537,7 +537,7 @@ class LiveRunner:
             return
         try:
             # Dust sweep: close any exchange positions too small to manage
-            DUST_THRESHOLD_USD = 20.0
+            DUST_THRESHOLD_USD = 10.0
             try:
                 all_positions = self.executor.get_positions()
                 for p in all_positions:
@@ -693,7 +693,7 @@ class LiveRunner:
                     rem_size = float(p.get("size", 0))
                     rem_ep = float(p.get("entry_price", 0))
                     rem_notional = rem_size * rem_ep
-                    if 0 < rem_notional < 20.0:
+                    if 0 < rem_notional < 10.0:
                         dust_side = "sell" if p.get("side", "long") == "long" else "buy"
                         log.warning("DUST: %s remnant $%.4f after close — sweeping", pos.asset, rem_notional)
                         self.executor.place_market_order(pos.asset, dust_side, rem_size, reduce_only=True)
